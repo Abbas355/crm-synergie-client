@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { useForm, useWatch } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { useSearch } from "wouter";
+import { useLocation } from "wouter";
 import { useToast } from "@/hooks/use-toast";
 import { useAuth } from "@/hooks/use-auth";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -64,7 +64,8 @@ const STATUS_OPTIONS = [
 export function NewClientFormComplete({ onClose, onSubmit, onSuccess, isSubmitting = false }: NewClientFormProps) {
   const { toast } = useToast();
   const { user } = useAuth();
-  const search = useSearch();
+  const location = useLocation();
+  const search = location.includes('?') ? location.split('?')[1] : '';
   const queryClient = useQueryClient();
   const [activeTab, setActiveTab] = useState("personnel");
   const [isLoadingCity, setIsLoadingCity] = useState(false);
