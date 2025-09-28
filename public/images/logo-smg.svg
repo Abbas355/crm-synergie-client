@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 100" width="300" height="100">
+  <style>
+    .text { 
+      font-family: 'Arial', sans-serif;
+      font-weight: bold;
+      font-size: 60px;
+      fill: #5E2F8A; /* Couleur violette pour le logo SMG */
+    }
+    .subtext {
+      font-family: 'Arial', sans-serif;
+      font-size: 16px;
+      fill: #5E2F8A;
+    }
+  </style>
+  <g>
+    <text x="20" y="70" class="text">SMG</text>
+    <text x="20" y="90" class="subtext">SYNERGIE MARKETING GROUP</text>
+  </g>
+</svg>

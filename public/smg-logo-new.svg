@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="500" height="300" viewBox="0 0 500 300" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .navy-blue { fill: #1D2456; }
+    .blue { fill: #1978B5; }
+    .text { fill: #1978B5; font-family: Arial, sans-serif; font-size: 24px; font-weight: bold; }
+  </style>
+  
+  <g transform="translate(50, 70)">
+    <!-- S -->
+    <path class="navy-blue" d="M30,20 C10,20 0,40 0,60 C0,90 40,90 60,100 C80,110 80,130 60,140 C30,150 10,130 0,110 L30,90 C30,110 50,120 60,110 C70,100 60,90 40,80 C10,60 -20,50 -20,20 C-20,0 10,-10 40,10 C70,30 70,50 70,50 L40,70 C40,70 40,50 30,40 C20,30 10,30 10,40 C10,50 30,50 30,20"/>
+    
+    <!-- M -->
+    <path d="M90,0 L110,0 L155,60 L200,0 L220,0 L220,110 L200,110 L200,40 L155,100 L155,100 L110,40 L110,110 L90,110 Z" class="blue"/>
+    
+    <!-- G -->
+    <path class="navy-blue" d="M350,20 C325,5 290,5 275,30 C260,55 260,85 290,110 C320,135 365,120 380,90 L380,60 L300,60 L300,90 L350,90 C335,105 305,105 290,90 C275,75 290,45 305,35 C320,25 335,35 350,50 L370,25 C340,0 290,0 270,25 C250,50 250,100 280,125 C310,150 365,140 380,100 L380,20 L300,20 L300,35 Z"/>
+  </g>
+  
+  <!-- Text "SYNERGIE MARKETING GROUP" -->
+  <text x="250" y="250" class="text" text-anchor="middle">SYNERGIE MARKETING GROUP</text>
+</svg>

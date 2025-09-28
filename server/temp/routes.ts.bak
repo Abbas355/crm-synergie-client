@@ -1,0 +1,4884 @@
+import type { Express, Request, Response, NextFunction } from "express";
+import { createServer, type Server } from "http";
+import { setupAuth } from "./auth";
+import { db } from "../db";
+import { clients, contacts, campaigns, tasks, activities, simCards, recruiters, recruitmentProspects, recruitmentStages, recruitmentActivities, recruitmentNetworkStructure, recruitmentDocuments, DOCUMENT_TYPES, DocumentType, appSettings } from "@shared/schema";
+import { eq, desc, and, or, like, count, isNull, isNotNull, asc, lt, lte, gt, gte, ne, sql, inArray, not } from "drizzle-orm";
+import { getOrGenerateVendorCode } from "./utils/vendor-code";
+import { Pool } from 'pg';
+import multer from 'multer';
+import path from 'path';
+import crypto from 'crypto';
+import fs from 'fs';
+
+// Configuration de multer pour les uploads de fichiers
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    // Créer le dossier s'il n'existe pas
+    const uploadDir = path.join(__dirname, '../uploads');
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+    console.log(`Upload directory: ${uploadDir}`);
+    cb(null, uploadDir);
+  },
+  filename: function (req, file, cb) {
+    // Générer un nom de fichier unique
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    const filename = uniqueSuffix + path.extname(file.originalname);
+    console.log(`Generated filename: ${filename} for original: ${file.originalname}`);
+    cb(null, filename);
+  }
+});
+
+// Configurer les limites et filtres pour Multer
+const upload = multer({ 
+  storage,
+  limits: {
+    fileSize: 5 * 1024 * 1024, // 5MB max
+  },
+  fileFilter: function(req, file, cb) {
+    // Accepter uniquement les images 
+    const allowedMimes = ['image/jpeg', 'image/png', 'image/gif', 'image/svg+xml'];
+    if (allowedMimes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error(`Type de fichier non autorisé. Autorisés: ${allowedMimes.join(', ')}`));
+    }
+  }
+});
+
+export async function registerRoutes(app: Express): Promise<Server> {
+  // Setup authentication routes
+  setupAuth(app);
+
+  // API Routes pour le dashboard et les activités récentes
+  app.get("/api/dashboard/activities", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      console.log("Récupération des activités récentes avec optimisation...");
+      
+      // Utilisation de SQL brut pour optimiser la requête avec jointures
+      const results = await db.execute(sql`
+        SELECT 
+          a.id, 
+          a.title, 
+          a.type, 
+          a.created_at as "createdAt",
+          u.username,
+          COALESCE(c.name, CONCAT(COALESCE(c.prenom, ''), ' ', COALESCE(c.nom, ''))) as "clientName",
+          cam.name as "campaignName"
+        FROM activities a
+        LEFT JOIN users u ON a.user_id = u.id
+        LEFT JOIN clients c ON a.client_id = c.id
+        LEFT JOIN campaigns cam ON a.campaign_id = cam.id
+        ORDER BY a.created_at DESC
+        LIMIT 10
+      `);
+      
+      // Convertir les résultats bruts en format attendu
+      const formattedActivities = (results as any).rows.map((activity: any) => ({
+        id: activity.id,
+        title: activity.title,
+        type: activity.type,
+        createdAt: new Date(activity.createdAt).toISOString(),
+        user: activity.username || req.user.username,
+        clientName: activity.clientName && activity.clientName.trim() !== ' ' ? activity.clientName.trim() : null,
+        campaignName: activity.campaignName || null
+      }));
+      
+      return res.json(formattedActivities);
+    } catch (error) {
+      console.error("Erreur lors de la récupération des activités récentes:", error);
+      return res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+  
+  app.get("/api/dashboard/tasks", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      console.log("Récupération des tâches à venir avec optimisation...");
+      
+      // Déterminer si l'utilisateur est un administrateur
+      const isAdmin = [1, 15].includes(req.user.id); // IDs des utilisateurs admin connus
+      
+      // Construire la requête SQL en fonction du rôle
+      let query;
+      
+      if (isAdmin) {
+        // Les administrateurs voient toutes les tâches administratives
+        query = sql`
+          SELECT 
+            t.id, 
+            t.title, 
+            t.priority, 
+            t.due_date as "dueDate",
+            u.username,
+            COALESCE(c.name, CONCAT(COALESCE(c.prenom, ''), ' ', COALESCE(c.nom, ''))) as "clientName"
+          FROM tasks t
+          LEFT JOIN users u ON t.user_id = u.id
+          LEFT JOIN clients c ON t.client_id = c.id
+          WHERE t.due_date >= NOW() AND t.task_type = 'admin'
+          ORDER BY t.due_date ASC
+          LIMIT 10
+        `;
+      } else {
+        // Les vendeurs ne voient que leurs propres tâches
+        query = sql`
+          SELECT 
+            t.id, 
+            t.title, 
+            t.priority, 
+            t.due_date as "dueDate",
+            u.username,
+            COALESCE(c.name, CONCAT(COALESCE(c.prenom, ''), ' ', COALESCE(c.nom, ''))) as "clientName"
+          FROM tasks t
+          LEFT JOIN users u ON t.user_id = u.id
+          LEFT JOIN clients c ON t.client_id = c.id
+          WHERE t.due_date >= NOW() 
+            AND t.user_id = ${req.user.id}
+            AND t.task_type = 'vendeur'
+          ORDER BY t.due_date ASC
+          LIMIT 10
+        `;
+      }
+      
+      const results = await db.execute(query);
+      
+      // Si la base de données ne contient pas de tâches, utiliser des tâches par défaut pour la démo
+      if ((results as any).rows.length === 0) {
+        const defaultTasks = [
+          {
+            id: 1,
+            title: "Appeler le client Société DEF pour suivi de proposition",
+            priority: "urgent",
+            dueDate: new Date().toISOString(),
+            assignedTo: req.user.username,
+            clientName: "Société DEF"
+          },
+          {
+            id: 2,
+            title: "Préparer proposition commerciale pour Entreprise GHI",
+            priority: "moyen",
+            dueDate: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(), // demain
+            assignedTo: req.user.username,
+            clientName: "Entreprise GHI"
+          },
+          {
+            id: 3,
+            title: "Finaliser la campagne réseaux sociaux pour le produit X",
+            priority: "faible",
+            dueDate: new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString(), // dans 3 jours
+            assignedTo: req.user.username
+          }
+        ];
+        return res.json(defaultTasks);
+      }
+      
+      // Transformer les données pour correspondre au format attendu
+      const formattedTasks = (results as any).rows.map((task: any) => ({
+        id: task.id,
+        title: task.title,
+        priority: task.priority || "moyen",
+        dueDate: new Date(task.dueDate).toISOString(),
+        assignedTo: task.username || req.user.username,
+        clientName: task.clientName && task.clientName.trim() !== ' ' ? task.clientName.trim() : null
+      }));
+      
+      return res.json(formattedTasks);
+    } catch (error) {
+      console.error("Erreur lors de la récupération des tâches à venir:", error);
+      return res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+  
+  // Créer une nouvelle activité
+  app.post("/api/activities", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      const activityData = {
+        ...req.body,
+        userId: req.user.id,
+        createdAt: new Date()
+      };
+      
+      // Insérer l'activité (sans validation de schéma pour le moment)
+      const [newActivity] = await db.insert(activities).values(activityData).returning();
+      
+      return res.status(201).json(newActivity);
+    } catch (error) {
+      console.error("Erreur lors de la création d'une activité:", error);
+      return res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+  
+  // Créer une nouvelle tâche
+  app.post("/api/tasks", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      // Déterminer si l'utilisateur est un administrateur
+      const isAdmin = [1, 15].includes(req.user.id); // IDs des utilisateurs admin connus
+      
+      // Déterminer le type de tâche en fonction du rôle de l'utilisateur
+      const taskType = isAdmin ? "admin" : "vendeur";
+      
+      // Ajouter le type de tâche aux données
+      const taskData = {
+        ...req.body,
+        userId: req.user.id,
+        createdAt: new Date(),
+        taskType
+      };
+      
+      // Insérer la tâche
+      const [newTask] = await db.insert(tasks).values(taskData).returning();
+      
+      // Créer une activité pour la nouvelle tâche
+      await db.insert(activities).values({
+        title: `Nouvelle tâche créée: ${newTask.title} (${taskType})`,
+        type: "tache",
+        userId: req.user.id,
+        createdAt: new Date()
+      });
+      
+      return res.status(201).json(newTask);
+    } catch (error) {
+      console.error("Erreur lors de la création d'une tâche:", error);
+      return res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+  
+  // API Routes for clients
+  app.get("/api/clients", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      console.log("Récupération des clients pour l'utilisateur:", req.user.id);
+      
+      const { search, code_vendeur } = req.query;
+      let clientList;
+      
+      // Déterminer si l'utilisateur est un administrateur (pour le filtrage)
+      const isAdmin = [1, 15].includes(req.user.id); // IDs des utilisateurs admin connus
+      
+      // Construire la requête de base en fonction du rôle
+      let baseQuery = db.select().from(clients);
+      
+      // Les vendeurs ne peuvent voir que leurs propres clients
+      if (!isAdmin) {
+        // Chercher d'abord si l'utilisateur est un vendeur avec un code vendeur
+        const recruiter = await db.query.recruiters.findFirst({
+          where: eq(recruiters.userId, req.user.id)
+        });
+        
+        // Si c'est un vendeur, filtrer par son code vendeur, sinon par userId
+        if (recruiter && recruiter.codeVendeur) {
+          baseQuery = baseQuery.where(eq(clients.codeVendeur, recruiter.codeVendeur));
+        } else {
+          baseQuery = baseQuery.where(eq(clients.userId, req.user.id));
+        }
+      }
+      
+      // Appliquer les filtres additionnels
+      if (code_vendeur && typeof code_vendeur === 'string' && isAdmin) {
+        // Seuls les admins peuvent filtrer par code vendeur explicitement
+        console.log(`Filtrage par code vendeur: ${code_vendeur}`);
+        clientList = await baseQuery
+          .where(eq(clients.codeVendeur, code_vendeur))
+          .orderBy((eb) => [
+            desc(clients.dateSignature),
+            desc(clients.createdAt)
+          ]);
+      } else if (search && typeof search === 'string') {
+        // La recherche s'applique à la requête filtrée par rôle
+        clientList = await baseQuery
+          .where(
+            or(
+              like(clients.nom, `%${search}%`),
+              like(clients.prenom, `%${search}%`),
+              like(clients.email, `%${search}%`)
+            )
+          )
+          .orderBy((eb) => [
+            desc(clients.dateSignature),
+            desc(clients.createdAt)
+          ]);
+      } else {
+        // Récupérer les clients avec les filtres de base appliqués
+        clientList = await baseQuery
+          .orderBy((eb) => [
+            desc(clients.dateSignature),
+            desc(clients.createdAt)
+          ]);
+      }
+      
+      console.log("Nombre de clients récupérés:", clientList.length);
+      
+      res.json(clientList);
+    } catch (error) {
+      console.error("Erreur lors de la récupération des clients:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  app.get("/api/clients/:id", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      const { id } = req.params;
+      const { debug } = req.query;
+      const clientId = parseInt(id);
+      
+      if (isNaN(clientId)) {
+        return res.status(400).json({ message: "ID client invalide" });
+      }
+      
+      // Debug log
+      if (debug) {
+        console.log(`Requête de client ID ${clientId} reçue`);
+      }
+      
+      const client = await db.query.clients.findFirst({
+        where: eq(clients.id, clientId),
+        with: {
+          contacts: true
+        }
+      });
+      
+      if (!client) {
+        return res.status(404).json({ message: "Client non trouvé" });
+      }
+      
+      // Vérifier si l'utilisateur a le droit d'accéder à ce client
+      const isAdmin = [1, 15].includes(req.user.id); // IDs des utilisateurs admin connus
+      
+      if (!isAdmin) {
+        // Si ce n'est pas un admin, vérifier si c'est son client
+        const recruiter = await db.query.recruiters.findFirst({
+          where: eq(recruiters.userId, req.user.id)
+        });
+        
+        const hasAccess = 
+          (client.userId === req.user.id) || // Le client appartient directement à l'utilisateur
+          (recruiter && recruiter.codeVendeur && client.codeVendeur === recruiter.codeVendeur); // Le client a le même code vendeur
+        
+        if (!hasAccess) {
+          return res.status(403).json({ message: "Vous n'avez pas accès à ce client" });
+        }
+      }
+      
+      // Get associated tasks
+      // Récupérer les tâches associées au client sans restriction par utilisateur
+      const clientTasks = await db.select().from(tasks)
+        .where(eq(tasks.clientId, clientId))
+        .orderBy(desc(tasks.createdAt));
+      
+      // Get activities
+      // Récupérer les activités associées au client sans restriction par utilisateur
+      const clientActivities = await db.select().from(activities)
+        .where(eq(activities.clientId, clientId))
+        .orderBy(desc(activities.createdAt));
+        
+      // Si le client a une carte SIM, récupérer les détails de cette carte
+      let carteSIMDetails = null;
+      if (client.carteSIM) {
+        const carteSIMId = Number(client.carteSIM);
+        if (!isNaN(carteSIMId)) {
+          if (debug) {
+            console.log(`Récupération de la carte SIM ID ${carteSIMId} associée au client ${clientId}`);
+          }
+          
+          // Récupération complète de la carte SIM, sans filtrage sur l'utilisateur
+          const carteDetails = await db
+            .select({
+              id: simCards.id,
+              numero: simCards.numero,
+              statut: simCards.statut,
+              dateAttribution: simCards.dateAttribution,
+              dateActivation: simCards.dateActivation
+            })
+            .from(simCards)
+            .where(eq(simCards.id, carteSIMId))
+            .limit(1)
+            .then(rows => rows[0]);
+          
+          if (carteDetails) {
+            carteSIMDetails = carteDetails;
+            if (debug) {
+              console.log(`Carte SIM trouvée:`, carteDetails);
+            }
+          } else if (debug) {
+            console.log(`Aucune carte SIM trouvée avec l'ID ${carteSIMId}`);
+            
+            // Tentative de récupération sans condition d'utilisateur
+            const carteDetailsSansUser = await db
+              .select({
+                id: simCards.id,
+                numero: simCards.numero,
+                statut: simCards.statut,
+                dateAttribution: simCards.dateAttribution,
+                dateActivation: simCards.dateActivation
+              })
+              .from(simCards)
+              .where(eq(simCards.id, carteSIMId))
+              .limit(1)
+              .then(rows => rows[0]);
+              
+            if (carteDetailsSansUser) {
+              console.log(`Carte SIM trouvée sans filtre utilisateur:`, carteDetailsSansUser);
+              carteSIMDetails = carteDetailsSansUser;
+            }
+          }
+        }
+      }
+      
+      res.json({ 
+        ...client,
+        tasks: clientTasks,
+        activities: clientActivities,
+        carteSIMDetails
+      });
+    } catch (error) {
+      console.error("Erreur lors de la récupération du client:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  app.post("/api/clients", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      // Extraire tous les champs individuellement
+      const { 
+        nom, prenom, email, mobile, civilite, dateSignature,
+        fixe, dateNaissance, adresse, codePostal, ville, produit,
+        identifiantContrat, carteSIM, portabilite, numeroPorter, source,
+        typeRecommandation, civiliteProspect, prenomProspect, nomProspect,
+        mobileProspect, codePostalProspect, villeProspect, commentaire, status,
+        type, userId, codeVendeur: manualCodeVendeur
+      } = req.body;
+      
+      // Log pour déboguer en développement et production
+      console.log("📄 Création client - Données reçues:", JSON.stringify(req.body, null, 2));
+      
+      // Vérification plus intelligente du nom
+      if (nom === undefined || nom === null || (typeof nom === 'string' && nom.trim() === '')) {
+        console.log("❌ Validation nom échouée:", nom);
+        return res.status(400).json({ message: "Le nom du client est requis" });
+      }
+      
+      // S'assurer que le nom est une chaîne de caractères
+      const nomFinal = String(nom).trim();
+      if (nomFinal === '') {
+        console.log("❌ Nom vide après conversion:", nom, "→", nomFinal);
+        return res.status(400).json({ message: "Le nom du client est requis" });
+      }
+      
+      // Traiter toutes les entrées de texte pour s'assurer qu'elles sont en format string
+      const processStringField = (field: any): string | null => {
+        if (field === undefined || field === null) return null;
+        const trimmed = String(field).trim();
+        return trimmed.length > 0 ? trimmed : null;
+      };
+      
+      // Récupérer uniquement les chaînes non vides
+      const processedFields = {
+        prenom: processStringField(prenom),
+        email: processStringField(email),
+        phone: processStringField(mobile),
+        civilite: processStringField(civilite),
+        fixe: processStringField(fixe),
+        dateNaissance: processStringField(dateNaissance),
+        adresse: processStringField(adresse),
+        codePostal: processStringField(codePostal),
+        ville: processStringField(ville),
+        produit: processStringField(produit),
+        identifiantContrat: processStringField(identifiantContrat),
+        carteSIM: processStringField(carteSIM),
+        portabilite: processStringField(portabilite),
+        numeroPorter: processStringField(numeroPorter),
+        source: processStringField(source),
+        typeRecommandation: processStringField(typeRecommandation),
+        civiliteProspect: processStringField(civiliteProspect),
+        prenomProspect: processStringField(prenomProspect),
+        nomProspect: processStringField(nomProspect),
+        mobileProspect: processStringField(mobileProspect),
+        codePostalProspect: processStringField(codePostalProspect),
+        villeProspect: processStringField(villeProspect),
+        commentaire: processStringField(commentaire),
+        status: processStringField(status) || "enregistre",
+        type: processStringField(type) || "client"
+      };
+      
+      // Gérer correctement la date de signature
+      let parsedDateSignature: Date | null = null;
+      if (dateSignature) {
+        try {
+          // Si c'est une chaîne ISO, la convertir en Date
+          if (typeof dateSignature === 'string') {
+            parsedDateSignature = new Date(dateSignature);
+          } else if (dateSignature instanceof Date) {
+            parsedDateSignature = dateSignature;
+          } else if (typeof dateSignature === 'object' && dateSignature !== null) {
+            // Si c'est un objet avec une structure de date comme {year, month, day}
+            const dateObj: any = dateSignature;
+            if (dateObj.year && dateObj.month) {
+              parsedDateSignature = new Date(
+                Number(dateObj.year), 
+                Number(dateObj.month) - 1, 
+                Number(dateObj.day || 1)
+              );
+            }
+          }
+          
+          // Vérifier si la date est valide
+          if (parsedDateSignature && isNaN(parsedDateSignature.getTime())) {
+            console.log("⚠️ Date de signature invalide:", dateSignature);
+            parsedDateSignature = new Date(); // Utiliser une date par défaut
+          }
+        } catch (err) {
+          console.log("⚠️ Erreur lors du parsing de la date de signature:", err);
+          parsedDateSignature = new Date(); // Utiliser une date par défaut
+        }
+      } else {
+        // Utiliser la date actuelle par défaut
+        parsedDateSignature = new Date();
+      }
+      
+      // Mettre à jour le nom pour name
+      const name = `${processedFields.prenom || ''} ${nomFinal}`.trim();
+      
+      // Récupérer ou générer le code vendeur pour l'utilisateur connecté
+      const codeVendeur = await getOrGenerateVendorCode(req.user.id);
+      console.log(`Code vendeur utilisé pour le client: ${codeVendeur}`);
+      
+      // Construction d'un objet d'insertion valide avec des valeurs nettoyées
+      const insertData = {
+        nom: nomFinal,
+        name,
+        userId: req.user.id,
+        dateSignature: parsedDateSignature,
+        codeVendeur, // Ajouter automatiquement le code vendeur
+        ...processedFields
+      };
+      
+      console.log("✅ Données préparées pour insertion:", insertData);
+      
+      try {
+        // Insérer directement avec les bons noms de colonnes
+        const newClients = await db.insert(clients).values(insertData).returning();
+        
+        if (!newClients || newClients.length === 0) {
+          throw new Error("Échec de création du client - aucun client retourné");
+        }
+        
+        const newClient = newClients[0];
+        console.log("✅ Nouveau client créé:", newClient.id);
+        
+        // Si une carte SIM a été attribuée, mettre à jour son statut à "Activé"
+        if (processedFields.carteSIM) {
+          try {
+            const carteSIMId = Number(processedFields.carteSIM);
+            if (!isNaN(carteSIMId)) {
+              await db.update(simCards)
+                .set({ 
+                  statut: "Activé", 
+                  clientId: newClient.id,
+                  dateAttribution: parsedDateSignature
+                })
+                .where(eq(simCards.id, carteSIMId));
+              
+              console.log(`✅ Carte SIM ID ${carteSIMId} mise à jour avec statut "Activé"`);
+            }
+          } catch (simError) {
+            console.error("❌ Erreur lors de la mise à jour de la carte SIM:", simError);
+            // Ne pas faire échouer la création du client si l'attribution de la carte SIM échoue
+          }
+        }
+        
+        // Ajouter une activité
+        try {
+          const activityTitle = `Nouveau client ajouté : ${processedFields.prenom || ""} ${nomFinal}`.trim();
+          await db.insert(activities).values({
+            title: activityTitle,
+            type: "Client",
+            userId: req.user.id,
+            clientId: newClient.id
+          });
+          console.log("✅ Activité créée pour le nouveau client");
+        } catch (activityError) {
+          console.error("❌ Erreur lors de la création de l'activité:", activityError);
+          // Ne pas faire échouer la création du client si la création de l'activité échoue
+        }
+        
+        return res.status(201).json(newClient);
+      } catch (dbError) {
+        console.error("❌ Erreur d'insertion dans la base de données:", dbError);
+        return res.status(500).json({ 
+          message: "Erreur lors de l'enregistrement du client dans la base de données",
+          details: dbError instanceof Error ? dbError.message : "Erreur inconnue"
+        });
+      }
+    } catch (error) {
+      console.error("❌ Erreur générale lors de la création du client:", error);
+      res.status(500).json({ 
+        message: "Erreur serveur lors de la création du client",
+        details: error instanceof Error ? error.message : "Erreur inconnue" 
+      });
+    }
+  });
+
+  app.put("/api/clients/:id", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      const { id } = req.params;
+      const clientId = parseInt(id);
+      
+      if (isNaN(clientId)) {
+        return res.status(400).json({ message: "ID client invalide" });
+      }
+      
+      // Extraire tous les champs individuellement
+      const { 
+        nom, prenom, email, mobile, civilite, dateSignature,
+        fixe, dateNaissance, adresse, codePostal, ville, produit,
+        identifiantContrat, carteSIM, portabilite, numeroPorter, source,
+        typeRecommandation, civiliteProspect, prenomProspect, nomProspect,
+        mobileProspect, codePostalProspect, villeProspect, commentaire, status,
+        type
+      } = req.body;
+      
+      // Log pour déboguer en développement et production
+      console.log("📄 Mise à jour client - Données reçues:", JSON.stringify(req.body, null, 2));
+      
+      // Vérification plus intelligente du nom
+      if (nom === undefined || nom === null || (typeof nom === 'string' && nom.trim() === '')) {
+        console.log("❌ Validation nom échouée lors de la mise à jour:", nom);
+        return res.status(400).json({ message: "Le nom du client est requis" });
+      }
+      
+      // S'assurer que le nom est une chaîne de caractères
+      const nomFinal = String(nom).trim();
+      if (nomFinal === '') {
+        console.log("❌ Nom vide après conversion (mise à jour):", nom, "→", nomFinal);
+        return res.status(400).json({ message: "Le nom du client est requis" });
+      }
+      
+      // Traiter toutes les entrées de texte pour s'assurer qu'elles sont en format string
+      const processStringField = (field: any): string | null => {
+        if (field === undefined || field === null) return null;
+        const trimmed = String(field).trim();
+        return trimmed.length > 0 ? trimmed : null;
+      };
+      
+      // Récupérer uniquement les chaînes non vides
+      const processedFields = {
+        prenom: processStringField(prenom),
+        email: processStringField(email),
+        phone: processStringField(mobile),
+        civilite: processStringField(civilite),
+        fixe: processStringField(fixe),
+        dateNaissance: processStringField(dateNaissance),
+        adresse: processStringField(adresse),
+        codePostal: processStringField(codePostal),
+        ville: processStringField(ville),
+        produit: processStringField(produit),
+        identifiantContrat: processStringField(identifiantContrat),
+        carteSIM: processStringField(carteSIM),
+        portabilite: processStringField(portabilite),
+        numeroPorter: processStringField(numeroPorter),
+        source: processStringField(source),
+        typeRecommandation: processStringField(typeRecommandation),
+        civiliteProspect: processStringField(civiliteProspect),
+        prenomProspect: processStringField(prenomProspect),
+        nomProspect: processStringField(nomProspect),
+        mobileProspect: processStringField(mobileProspect),
+        codePostalProspect: processStringField(codePostalProspect),
+        villeProspect: processStringField(villeProspect),
+        commentaire: processStringField(commentaire),
+        status: processStringField(status) || "enregistre",
+        type: processStringField(type) || "client"
+      };
+      
+      // Gérer correctement la date de signature
+      let parsedDateSignature: Date | null = null;
+      if (dateSignature) {
+        try {
+          // Si c'est une chaîne ISO, la convertir en Date
+          if (typeof dateSignature === 'string') {
+            parsedDateSignature = new Date(dateSignature);
+          } else if (dateSignature instanceof Date) {
+            parsedDateSignature = dateSignature;
+          } else if (typeof dateSignature === 'object' && dateSignature !== null) {
+            // Si c'est un objet avec une structure de date comme {year, month, day}
+            const dateObj: any = dateSignature;
+            if (dateObj.year && dateObj.month) {
+              parsedDateSignature = new Date(
+                Number(dateObj.year), 
+                Number(dateObj.month) - 1, 
+                Number(dateObj.day || 1)
+              );
+            }
+          }
+          
+          // Vérifier si la date est valide
+          if (parsedDateSignature && isNaN(parsedDateSignature.getTime())) {
+            console.log("⚠️ Date de signature invalide (mise à jour):", dateSignature);
+            // Conserver la date existante si possible, sinon utiliser la date actuelle
+            parsedDateSignature = null;
+          }
+        } catch (err) {
+          console.log("⚠️ Erreur lors du parsing de la date de signature (mise à jour):", err);
+          parsedDateSignature = null;
+        }
+      }
+      
+      try {
+        // Vérifier que le client existe (sans restriction par utilisateur)
+        const existingClient = await db.query.clients.findFirst({
+          where: eq(clients.id, clientId)
+        });
+        
+        if (!existingClient) {
+          return res.status(404).json({ message: "Client non trouvé" });
+        }
+        
+        // Utiliser la date existante si la nouvelle n'est pas valide
+        if (parsedDateSignature === null && existingClient.dateSignature) {
+          parsedDateSignature = existingClient.dateSignature;
+        } else if (parsedDateSignature === null) {
+          parsedDateSignature = new Date(); // Fallback sur la date actuelle
+        }
+        
+        // Mettre à jour le nom pour name
+        const name = `${processedFields.prenom || ''} ${nomFinal}`.trim();
+        
+        // Récupérer ou conserver le code vendeur
+        let codeVendeur = existingClient.codeVendeur;
+        
+        // Si le client n'a pas de code vendeur, en attribuer un de l'utilisateur connecté
+        if (!codeVendeur) {
+          codeVendeur = await getOrGenerateVendorCode(req.user.id);
+          console.log(`Code vendeur attribué au client lors de la mise à jour: ${codeVendeur}`);
+        } else {
+          console.log(`Code vendeur conservé pour le client: ${codeVendeur}`);
+        }
+        
+        // Construction d'un objet d'insertion valide avec des valeurs nettoyées
+        const updateData = {
+          nom: nomFinal,
+          name,
+          dateSignature: parsedDateSignature,
+          codeVendeur,
+          ...processedFields
+        };
+        
+        console.log("✅ Données préparées pour mise à jour:", updateData);
+        
+        try {
+          // Utiliser Drizzle ORM pour mettre à jour le client
+          const updatedClientResult = await db.update(clients)
+            .set(updateData)
+            .where(eq(clients.id, clientId))
+            .returning();
+          
+          if (!updatedClientResult || updatedClientResult.length === 0) {
+            throw new Error("Échec de mise à jour du client - aucun client retourné");
+          }
+          
+          const updatedClient = updatedClientResult[0];
+          console.log("✅ Client mis à jour:", updatedClient.id);
+          
+          // Si une carte SIM a été attribuée et qu'elle est différente de l'ancienne, mettre à jour son statut
+          if (processedFields.carteSIM && processedFields.carteSIM !== existingClient.carteSIM) {
+            try {
+              const carteSIMId = Number(processedFields.carteSIM);
+              if (!isNaN(carteSIMId)) {
+                // Mettre à jour la nouvelle carte SIM
+                await db.update(simCards)
+                  .set({ 
+                    statut: "Activé", 
+                    clientId: clientId,
+                    dateAttribution: parsedDateSignature 
+                  })
+                  .where(eq(simCards.id, carteSIMId));
+                
+                console.log(`✅ Carte SIM ID ${carteSIMId} mise à jour avec statut "Activé"`);
+                
+                // Si le client avait déjà une carte SIM, remettre son statut à "Disponible"
+                if (existingClient.carteSIM) {
+                  const ancienneCarteSIMId = Number(existingClient.carteSIM);
+                  if (!isNaN(ancienneCarteSIMId)) {
+                    await db.update(simCards)
+                      .set({ statut: "Disponible", clientId: null })
+                      .where(eq(simCards.id, ancienneCarteSIMId));
+                    
+                    console.log(`✅ Ancienne carte SIM ID ${ancienneCarteSIMId} remise à "Disponible"`);
+                  }
+                }
+              }
+            } catch (simError) {
+              console.error("❌ Erreur lors de la mise à jour de la carte SIM:", simError);
+              // Ne pas faire échouer la mise à jour du client si la mise à jour de la carte SIM échoue
+            }
+          }
+          
+          // Ajouter une activité
+          try {
+            const activityTitle = `Client mis à jour : ${processedFields.prenom || ""} ${nomFinal}`.trim();
+            await db.insert(activities).values({
+              title: activityTitle,
+              type: "Client",
+              userId: req.user.id,
+              clientId: clientId
+            });
+            console.log("✅ Activité créée pour la mise à jour du client");
+          } catch (activityError) {
+            console.error("❌ Erreur lors de la création de l'activité:", activityError);
+            // Ne pas faire échouer la mise à jour du client si la création de l'activité échoue
+          }
+          
+          return res.json(updatedClient);
+        } catch (dbError) {
+          console.error("❌ Erreur d'insertion dans la base de données:", dbError);
+          return res.status(500).json({ 
+            message: "Erreur lors de la mise à jour du client dans la base de données",
+            details: dbError instanceof Error ? dbError.message : "Erreur inconnue"
+          });
+        }
+      } catch (clientError) {
+        console.error("❌ Erreur lors de la recherche du client:", clientError);
+        return res.status(500).json({ 
+          message: "Erreur lors de la recherche du client", 
+          details: clientError instanceof Error ? clientError.message : "Erreur inconnue"
+        });
+      }
+    } catch (error) {
+      console.error("❌ Erreur générale lors de la mise à jour du client:", error);
+      res.status(500).json({ 
+        message: "Erreur serveur lors de la mise à jour du client",
+        details: error instanceof Error ? error.message : "Erreur inconnue" 
+      });
+    }
+  });
+
+  app.delete("/api/clients/:id", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      const { id } = req.params;
+      const clientId = parseInt(id);
+      
+      if (isNaN(clientId)) {
+        return res.status(400).json({ message: "ID client invalide" });
+      }
+      
+      // Vérifier que le client existe (sans restriction par utilisateur)
+      const existingClient = await db.query.clients.findFirst({
+        where: eq(clients.id, clientId)
+      });
+      
+      if (!existingClient) {
+        return res.status(404).json({ message: "Client non trouvé" });
+      }
+      
+      try {
+        // 1. Supprimer d'abord toutes les activités liées au client
+        console.log(`Suppression des activités pour le client ${clientId}`);
+        await db.delete(activities)
+          .where(eq(activities.clientId, clientId));
+        
+        // 2. Supprimer les tâches liées au client
+        console.log(`Suppression des tâches pour le client ${clientId}`);
+        await db.delete(tasks)
+          .where(eq(tasks.clientId, clientId));
+          
+        // 3. Si le client avait une carte SIM, la libérer en remettant son statut à "Disponible"
+        if (existingClient.carteSIM) {
+          const carteSIMId = Number(existingClient.carteSIM);
+          if (!isNaN(carteSIMId)) {
+            console.log(`Mise à jour de la carte SIM ${carteSIMId} à "disponible"`);
+            await db.update(simCards)
+              .set({ 
+                statut: "disponible", 
+                clientId: null,
+                dateAttribution: null,
+                dateActivation: null
+              })
+              .where(eq(simCards.id, carteSIMId));
+          }
+        }
+        
+        // 4. Supprimer le client lui-même
+        console.log(`Suppression du client ${clientId}`);
+        await db.delete(clients)
+          .where(eq(clients.id, clientId));
+          
+        // 5. Ajouter une activité pour la suppression, mais pas associée au client supprimé
+        const activityTitle = `Client supprimé : ${existingClient.prenom || ""} ${existingClient.nom || ""}`.trim();
+        await db.insert(activities)
+          .values({
+            title: activityTitle,
+            type: "Client",
+            userId: req.user.id
+          });
+        
+        res.status(204).send();
+      } catch (deleteError) {
+        console.error("Erreur détaillée lors de la suppression:", deleteError);
+        res.status(500).json({ 
+          message: "Erreur lors de la suppression", 
+          details: deleteError.message || "Erreur inconnue"
+        });
+      }
+    } catch (error) {
+      console.error("Erreur lors de la suppression du client:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  // Dashboard data
+  app.get("/api/dashboard", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      // Obtenir le nombre total de clients
+      const totalClientsCount = await db.select({ count: count() })
+        .from(clients)
+        .where(eq(clients.userId, req.user.id));
+      
+      // Obtenir le nombre de clients en validation
+      const validationClientsCount = await db.select({ count: count() })
+        .from(clients)
+        .where(and(
+          eq(clients.userId, req.user.id),
+          eq(clients.status, "valide")
+        ));
+      
+      // Obtenir le nombre d'installations
+      const installationClientsCount = await db.select({ count: count() })
+        .from(clients)
+        .where(and(
+          eq(clients.userId, req.user.id),
+          eq(clients.status, "installation")
+        ));
+      
+      // Obtenir le nombre de clients Freebox
+      const freeboxClientsCount = await db.select({ count: count() })
+        .from(clients)
+        .where(and(
+          eq(clients.userId, req.user.id),
+          eq(clients.type, "freebox")
+        ));
+      
+      // Get recent activities
+      const recentActivities = await db.select().from(activities)
+        .where(eq(activities.userId, req.user.id))
+        .orderBy(desc(activities.createdAt))
+        .limit(5);
+      
+      // Get upcoming tasks
+      const upcomingTasks = await db.select().from(tasks)
+        .where(and(
+          eq(tasks.userId, req.user.id),
+          eq(tasks.status, "en_cours")
+        ))
+        .orderBy(desc(tasks.createdAt))
+        .limit(5);
+      
+      const stats = {
+        totalClients: totalClientsCount[0].count,
+        validationClients: validationClientsCount[0].count,
+        installationClients: installationClientsCount[0].count,
+        freeboxClients: freeboxClientsCount[0].count
+      };
+      
+      res.json({
+        stats,
+        recentActivities,
+        upcomingTasks
+      });
+    } catch (error) {
+      console.error("Erreur lors de la récupération des données du tableau de bord:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  // API Routes pour les cartes SIM
+  app.get("/api/sim-cards", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      const { statut, search } = req.query;
+      const isClientCreation = req.query.clientCreation === 'true';
+      
+      // Déterminer si l'utilisateur est un administrateur (même logique que dans le reste de l'application)
+      const isAdmin = [1, 15].includes(req.user.id); // IDs des utilisateurs admin connus
+      
+      // Permettre l'accès aux vendeurs seulement pour la création de client
+      // Pour les autres cas, vérifier que l'utilisateur a les permissions administrateur
+      if (!isClientCreation && !isAdmin) {
+        return res.status(403).json({ message: "Accès non autorisé à la gestion des cartes SIM" });
+      }
+      
+      // Optimisation: filtrer directement dans la requête SQL plutôt qu'en mémoire
+      let whereConditions = sql`1=1`; // Condition toujours vraie pour commencer
+      
+      // Filtrer par statut si fourni
+      if (statut && typeof statut === 'string') {
+        if (statut === 'disponible') {
+          whereConditions = and(whereConditions, eq(simCards.statut, 'disponible'));
+        } else if (statut === 'affecte' || statut === 'active') {
+          // Le statut "active" est utilisé dans l'interface pour afficher les cartes SIM actives/affectées
+          whereConditions = and(whereConditions, or(
+            eq(simCards.statut, 'affecte'),
+            eq(simCards.statut, 'Activé')
+          ));
+        }
+      }
+      
+      // Utilisons la méthode select pour éviter les erreurs liées aux colonnes manquantes
+      const query = db
+        .select({
+          id: simCards.id,
+          codeVendeur: simCards.codeVendeur,
+          numero: simCards.numero,
+          statut: simCards.statut,
+          clientId: simCards.clientId,
+          dateAttribution: simCards.dateAttribution,
+          dateActivation: simCards.dateActivation,
+          note: simCards.note,
+          userId: simCards.userId,
+          createdAt: simCards.createdAt,
+          client: {
+            id: clients.id,
+            civilite: clients.civilite,
+            prenom: clients.prenom,
+            nom: clients.nom
+          }
+        })
+        .from(simCards)
+        .leftJoin(clients, eq(simCards.clientId, clients.id))
+        .where(whereConditions)
+        .orderBy(desc(simCards.createdAt));
+
+      let results = await query;
+      
+      // Recherche par numéro, code vendeur ou nom du client
+      if (search && typeof search === 'string') {
+        const searchLower = search.toLowerCase();
+        const filteredResults = [];
+        for (const card of results) {
+          if (card.numero.toLowerCase().includes(searchLower) || 
+              (card.codeVendeur && card.codeVendeur.toLowerCase().includes(searchLower)) ||
+              (card.client && 
+                ((card.client.prenom && card.client.prenom.toLowerCase().includes(searchLower)) ||
+                (card.client.nom && card.client.nom.toLowerCase().includes(searchLower)))
+              )) {
+            filteredResults.push(card);
+          }
+        }
+        results = filteredResults;
+      }
+      
+      // Transformer les résultats pour ajouter clientNom
+      const processedResults = results.map(card => ({
+        ...card,
+        clientNom: card.client ? 
+          `${card.client.prenom || ''} ${card.client.nom || ''}`.trim() : 
+          undefined
+      }));
+      
+      // Compter les statistiques
+      const totalCount = await db.select({ count: count() }).from(simCards);
+      
+      const disponiblesCount = await db.select({ count: count() }).from(simCards)
+        .where(eq(simCards.statut, 'disponible'));
+      
+      const affecteesCount = await db.select({ count: count() }).from(simCards)
+        .where(or(
+          eq(simCards.statut, 'affecte'),
+          eq(simCards.statut, 'Activé')
+        ));
+      
+      const stats = {
+        total: totalCount[0].count,
+        disponibles: disponiblesCount[0].count,
+        affectees: affecteesCount[0].count
+      };
+      
+      console.log("Nombre de cartes SIM récupérées:", processedResults.length);
+      
+      res.json({
+        simCards: processedResults,
+        stats
+      });
+    } catch (error) {
+      console.error("Erreur lors de la récupération des cartes SIM:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  app.get("/api/sim-cards/:id", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      const { id } = req.params;
+      const { debug } = req.query;
+      const simCardId = parseInt(id);
+      
+      if (isNaN(simCardId)) {
+        return res.status(400).json({ message: "ID de carte SIM invalide" });
+      }
+      
+      // Debug log
+      if (debug) {
+        console.log(`Requête de carte SIM ID ${simCardId} reçue`);
+      }
+      
+      // Utiliser select au lieu de query.findFirst pour éviter les erreurs avec civilite
+      const simCard = await db
+        .select({
+          id: simCards.id,
+          codeVendeur: simCards.codeVendeur,
+          numero: simCards.numero,
+          statut: simCards.statut,
+          clientId: simCards.clientId,
+          dateAttribution: simCards.dateAttribution,
+          dateActivation: simCards.dateActivation,
+          note: simCards.note,
+          userId: simCards.userId,
+          createdAt: simCards.createdAt,
+          client: {
+            id: clients.id,
+            civilite: clients.civilite,
+            prenom: clients.prenom,
+            nom: clients.nom
+          }
+        })
+        .from(simCards)
+        .leftJoin(clients, eq(simCards.clientId, clients.id))
+        // Ne pas filtrer par utilisateur pour la carte 7 (debug)
+        .where(simCardId === 7 
+          ? eq(simCards.id, simCardId)
+          : and(
+              eq(simCards.id, simCardId),
+              eq(simCards.userId, req.user.id)
+            ))
+        .limit(1)
+        .then(rows => rows[0]);
+      
+      if (!simCard) {
+        return res.status(404).json({ message: "Carte SIM non trouvée" });
+      }
+      
+      res.json(simCard);
+    } catch (error) {
+      console.error("Erreur lors de la récupération de la carte SIM:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  app.post("/api/sim-cards", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      const { codeVendeur, numero, note } = req.body;
+      
+      if (!codeVendeur || !numero) {
+        return res.status(400).json({ message: "Le code vendeur et le numéro sont requis" });
+      }
+      
+      // Vérifier format du numéro de carte SIM (19 chiffres commençant par 893315022201)
+      if (!/^893315022201\d{7}$/.test(numero)) {
+        return res.status(400).json({ message: "Le numéro de carte SIM doit être au format 893315022201 suivi de 7 chiffres" });
+      }
+      
+      // Vérifier si le numéro existe déjà
+      const existingCard = await db.query.simCards.findFirst({
+        where: eq(simCards.numero, numero)
+      });
+      
+      if (existingCard) {
+        return res.status(400).json({ message: "Ce numéro de carte SIM existe déjà" });
+      }
+      
+      const [newSimCard] = await db.insert(simCards).values({
+        codeVendeur,
+        numero,
+        statut: "disponible",
+        note,
+        userId: req.user.id
+      }).returning();
+      
+      // Ajout d'une activité pour la création
+      await db.insert(activities).values({
+        title: `Nouvelle carte SIM ajoutée : ${numero}`,
+        type: "CarteSIM",
+        userId: req.user.id
+      });
+      
+      res.status(201).json(newSimCard);
+    } catch (error) {
+      console.error("Erreur lors de la création de la carte SIM:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  app.put("/api/sim-cards/:id", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      const { id } = req.params;
+      const simCardId = parseInt(id);
+      
+      if (isNaN(simCardId)) {
+        return res.status(400).json({ message: "ID de carte SIM invalide" });
+      }
+      
+      const { codeVendeur, numero, statut, clientId, note } = req.body;
+      
+      // Vérifier si la carte SIM existe (sans restriction d'utilisateur)
+      const existingCard = await db.query.simCards.findFirst({
+        where: eq(simCards.id, simCardId)
+      });
+      
+      if (!existingCard) {
+        return res.status(404).json({ message: "Carte SIM non trouvée" });
+      }
+      
+      // Préparation des données à mettre à jour
+      let updateData: any = {
+        codeVendeur,
+        note
+      };
+      
+      // Vérifier si le numéro a changé
+      if (numero && numero !== existingCard.numero) {
+        // Vérifier format du numéro
+        if (!/^893315022201\d{7}$/.test(numero)) {
+          return res.status(400).json({ message: "Le numéro de carte SIM doit être au format 893315022201 suivi de 7 chiffres" });
+        }
+        
+        // Vérifier si le nouveau numéro existe déjà
+        const duplicateCard = await db.query.simCards.findFirst({
+          where: and(
+            eq(simCards.numero, numero),
+            ne(simCards.id, simCardId)
+          )
+        });
+        
+        if (duplicateCard) {
+          return res.status(400).json({ message: "Ce numéro de carte SIM existe déjà" });
+        }
+        
+        updateData.numero = numero;
+      }
+      
+      // Si le statut change pour "Activé", vérifier que clientId est fourni
+      if (statut === "Activé") {
+        if (!clientId) {
+          return res.status(400).json({ message: "Un client doit être associé à une carte SIM activée" });
+        }
+        
+        // Vérifier si le client existe (sans restriction d'utilisateur)
+        const client = await db.query.clients.findFirst({
+          where: eq(clients.id, clientId)
+        });
+        
+        if (!client) {
+          return res.status(404).json({ message: "Client non trouvé" });
+        }
+        
+        updateData.statut = "Activé";
+        updateData.clientId = clientId;
+        
+        // Utiliser la date de signature du client si elle existe, sinon la date actuelle
+        if (client.dateSignature) {
+          updateData.dateAttribution = client.dateSignature;
+        } else {
+          updateData.dateAttribution = new Date();
+        }
+        
+        // Si la carte n'a pas de date d'activation, en ajouter une
+        if (!existingCard.dateActivation) {
+          updateData.dateActivation = new Date();
+        }
+      } 
+      // Si le statut change pour "disponible", supprimer l'association client
+      else if (statut === "disponible") {
+        updateData.statut = statut;
+        updateData.clientId = null;
+        updateData.dateAttribution = null;
+      }
+      
+      const [updatedCard] = await db.update(simCards)
+        .set(updateData)
+        .where(eq(simCards.id, simCardId))
+        .returning();
+      
+      // Ajout d'une activité pour la mise à jour
+      await db.insert(activities).values({
+        title: `Carte SIM mise à jour : ${updatedCard.numero}`,
+        type: "CarteSIM",
+        userId: req.user.id,
+        clientId: updatedCard.clientId
+      });
+      
+      res.json(updatedCard);
+    } catch (error) {
+      console.error("Erreur lors de la mise à jour de la carte SIM:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  app.delete("/api/sim-cards/:id", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      const { id } = req.params;
+      const simCardId = parseInt(id);
+      
+      if (isNaN(simCardId)) {
+        return res.status(400).json({ message: "ID de carte SIM invalide" });
+      }
+      
+      // Vérifier si la carte SIM existe (sans restriction d'utilisateur)
+      const existingCard = await db.query.simCards.findFirst({
+        where: eq(simCards.id, simCardId)
+      });
+      
+      if (!existingCard) {
+        return res.status(404).json({ message: "Carte SIM non trouvée" });
+      }
+      
+      // Vérifier si la carte est déjà activée pour un client
+      if (existingCard.statut === "Activé" && existingCard.clientId) {
+        return res.status(400).json({ 
+          message: "Impossible de supprimer une carte SIM actuellement activée pour un client" 
+        });
+      }
+      
+      await db.delete(simCards)
+        .where(eq(simCards.id, simCardId));
+      
+      // Ajout d'une activité pour la suppression
+      await db.insert(activities).values({
+        title: `Carte SIM supprimée : ${existingCard.numero}`,
+        type: "CarteSIM",
+        userId: req.user.id
+      });
+      
+      res.status(204).send();
+    } catch (error) {
+      console.error("Erreur lors de la suppression de la carte SIM:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  // Route pour mettre à jour une carte SIM par son numéro (terminant par 6866)
+  app.post("/api/sim-cards/update-by-number", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      const { numeroSuffix, clientId, statut } = req.body;
+      
+      if (!numeroSuffix) {
+        return res.status(400).json({ message: "Suffixe du numéro de carte SIM requis" });
+      }
+      
+      // Rechercher la carte SIM par son numéro (se terminant par le suffixe fourni, sans restriction d'utilisateur)
+      const cards = await db.select().from(simCards)
+        .where(like(simCards.numero, `%${numeroSuffix}`));
+      
+      if (cards.length === 0) {
+        return res.status(404).json({ message: `Aucune carte SIM trouvée avec un numéro se terminant par ${numeroSuffix}` });
+      }
+      
+      if (cards.length > 1) {
+        return res.status(409).json({ 
+          message: `Plusieurs cartes SIM trouvées avec un numéro se terminant par ${numeroSuffix}`, 
+          cards 
+        });
+      }
+      
+      const card = cards[0];
+      const updateData: any = {};
+      
+      // Si un clientId est fourni, vérifier qu'il existe (sans restriction d'utilisateur)
+      if (clientId) {
+        const client = await db.query.clients.findFirst({
+          where: eq(clients.id, clientId)
+        });
+        
+        if (!client) {
+          return res.status(404).json({ message: "Client non trouvé" });
+        }
+        
+        updateData.clientId = clientId;
+        
+        // Utiliser la date de signature du client si elle existe, sinon la date actuelle
+        if (client.dateSignature) {
+          updateData.dateAttribution = client.dateSignature;
+        } else {
+          updateData.dateAttribution = new Date();
+        }
+      }
+      
+      // Si un statut est fourni, l'utiliser
+      if (statut) {
+        updateData.statut = statut;
+        
+        // Si le statut est "Activé", s'assurer que les dates d'attribution et d'activation sont définies
+        if (statut === "Activé") {
+          // Toujours assurer une date d'attribution si elle n'existe pas encore
+          if (!updateData.dateAttribution) {
+            // On vérifie si un client est associé pour utiliser sa date de signature
+            if (updateData.clientId) {
+              const client = await db.query.clients.findFirst({
+                where: eq(clients.id, updateData.clientId)
+              });
+              
+              if (client && client.dateSignature) {
+                updateData.dateAttribution = client.dateSignature;
+              } else {
+                updateData.dateAttribution = new Date();
+              }
+            } else {
+              updateData.dateAttribution = new Date();
+            }
+          }
+          
+          // Définir la date d'activation si elle n'existe pas déjà
+          if (!card.dateActivation) {
+            updateData.dateActivation = new Date();
+          }
+        }
+      }
+      
+      // Si aucune donnée à mettre à jour n'est fournie
+      if (Object.keys(updateData).length === 0) {
+        return res.status(400).json({ message: "Aucune donnée de mise à jour fournie" });
+      }
+      
+      // Mettre à jour la carte SIM
+      const [updatedCard] = await db.update(simCards)
+        .set(updateData)
+        .where(eq(simCards.id, card.id))
+        .returning();
+      
+      // Si la carte a été associée à un client, ajouter une activité
+      if (clientId && updateData.clientId) {
+        const client = await db.query.clients.findFirst({
+          where: eq(clients.id, clientId)
+        });
+        
+        if (client) {
+          await db.insert(activities).values({
+            title: `Carte SIM ${card.numero} mise à jour et affectée au client ${client.civilite} ${client.prenom} ${client.nom}`,
+            type: "CarteSIM",
+            userId: req.user.id,
+            clientId: clientId
+          });
+        }
+      }
+      
+      res.json(updatedCard);
+    } catch (error) {
+      console.error("Erreur lors de la mise à jour de la carte SIM:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+  
+  // Route pour importer des cartes SIM en masse
+  app.post("/api/sim-cards/import", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      const { simCards: simCardsList } = req.body;
+      
+      if (!Array.isArray(simCardsList) || simCardsList.length === 0) {
+        return res.status(400).json({ message: "Liste de cartes SIM invalide" });
+      }
+      
+      const validCards = [];
+      const invalidCards = [];
+      const existingNumbers = [];
+      
+      // Récupérer tous les numéros existants
+      const existingCardNumbers = await db.select({ numero: simCards.numero }).from(simCards);
+      const existingCardSet = new Set(existingCardNumbers.map(card => card.numero));
+      
+      // Valider chaque carte SIM
+      for (const card of simCardsList) {
+        const { codeVendeur, numero, note } = card;
+        
+        // Vérifier les champs obligatoires
+        if (!codeVendeur || !numero) {
+          invalidCards.push({ ...card, reason: "Code vendeur ou numéro manquant" });
+          continue;
+        }
+        
+        // Vérifier le format du numéro
+        if (!/^893315022201\d{7}$/.test(numero)) {
+          invalidCards.push({ ...card, reason: "Format de numéro invalide (doit être 893315022201 suivi de 7 chiffres)" });
+          continue;
+        }
+        
+        // Vérifier si le numéro existe déjà
+        if (existingCardSet.has(numero)) {
+          existingNumbers.push(numero);
+          continue;
+        }
+        
+        validCards.push({
+          codeVendeur,
+          numero,
+          statut: "disponible",
+          note: note || null,
+          userId: req.user.id
+        });
+      }
+      
+      let insertedCards = [];
+      
+      // Insérer les cartes valides
+      if (validCards.length > 0) {
+        insertedCards = await db.insert(simCards).values(validCards).returning();
+        
+        // Ajouter une activité pour l'import
+        await db.insert(activities).values({
+          title: `Import de ${validCards.length} cartes SIM`,
+          type: "CarteSIM",
+          userId: req.user.id
+        });
+      }
+      
+      res.status(201).json({
+        inserted: insertedCards.length,
+        invalid: invalidCards.length,
+        existing: existingNumbers.length,
+        details: {
+          invalidCards,
+          existingNumbers
+        }
+      });
+    } catch (error) {
+      console.error("Erreur lors de l'import des cartes SIM:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  // Route spéciale pour mettre à jour la carte SIM 6866 sans authentification
+  app.post("/api/public/sim-cards/update/6866", async (req: Request, res: Response) => {
+    try {
+      // Rechercher la carte SIM se terminant par 6866
+      const cards = await db.select().from(simCards)
+        .where(like(simCards.numero, '%6866'));
+      
+      if (cards.length === 0) {
+        return res.status(404).json({ message: "Aucune carte SIM trouvée avec un numéro se terminant par 6866" });
+      }
+      
+      // Mettre à jour la première carte trouvée (il ne devrait y en avoir qu'une)
+      const card = cards[0];
+      
+      await db.update(simCards)
+        .set({
+          statut: "Activé"
+        })
+        .where(eq(simCards.id, card.id));
+      
+      return res.status(200).json({ 
+        message: "Carte SIM mise à jour avec succès", 
+        cardId: card.id,
+        numero: card.numero,
+        newStatus: "Activé" 
+      });
+    } catch (error) {
+      console.error("Erreur lors de la mise à jour de la carte SIM 6866:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+  
+  // Route pour associer une carte SIM à un client en affectation rapide
+  app.post("/api/sim-cards/assign", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      const { clientId, simCardId } = req.body;
+      
+      if (!clientId || !simCardId) {
+        return res.status(400).json({ message: "ID client et ID carte SIM requis" });
+      }
+      
+      // Vérifier si le client existe (sans restriction d'utilisateur)
+      const client = await db.query.clients.findFirst({
+        where: eq(clients.id, clientId)
+      });
+      
+      if (!client) {
+        return res.status(404).json({ message: "Client non trouvé" });
+      }
+      
+      // Vérifier si la carte SIM existe (sans restriction d'utilisateur)
+      const card = await db.query.simCards.findFirst({
+        where: eq(simCards.id, simCardId)
+      });
+      
+      if (!card) {
+        return res.status(404).json({ message: "Carte SIM non trouvée" });
+      }
+      
+      if (card.statut === "Activé") {
+        return res.status(400).json({ message: "Cette carte SIM est déjà activée pour un client" });
+      }
+      
+      // Utiliser la date de signature du client si elle existe, sinon la date actuelle
+      let dateAttribution = new Date();
+      if (client.dateSignature) {
+        dateAttribution = client.dateSignature;
+      }
+      
+      const [updatedCard] = await db.update(simCards)
+        .set({
+          statut: "Activé", // Utiliser "Activé" au lieu de "affecte" pour la cohérence avec les autres parties de l'application
+          clientId: clientId,
+          dateAttribution: dateAttribution
+        })
+        .where(eq(simCards.id, simCardId))
+        .returning();
+      
+      // Ajouter une activité
+      await db.insert(activities).values({
+        title: `Carte SIM ${card.numero} affectée au client ${client.civilite} ${client.prenom} ${client.nom}`,
+        type: "CarteSIM",
+        userId: req.user.id,
+        clientId: clientId
+      });
+      
+      res.json(updatedCard);
+    } catch (error) {
+      console.error("Erreur lors de l'affectation de la carte SIM:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  // Mettre à jour le dashboard pour inclure les stats des cartes SIM
+  app.get("/api/dashboard", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      // Obtenir le nombre total de clients
+      const totalClientsCount = await db.select({ count: count() })
+        .from(clients)
+        .where(eq(clients.userId, req.user.id));
+      
+      // Obtenir le nombre de clients en validation
+      const validationClientsCount = await db.select({ count: count() })
+        .from(clients)
+        .where(and(
+          eq(clients.userId, req.user.id),
+          eq(clients.status, "valide")
+        ));
+      
+      // Obtenir le nombre d'installations
+      const installationClientsCount = await db.select({ count: count() })
+        .from(clients)
+        .where(and(
+          eq(clients.userId, req.user.id),
+          eq(clients.status, "installation")
+        ));
+      
+      // Obtenir le nombre de clients Freebox
+      const freeboxClientsCount = await db.select({ count: count() })
+        .from(clients)
+        .where(and(
+          eq(clients.userId, req.user.id),
+          eq(clients.type, "freebox")
+        ));
+      
+      // Obtenir le nombre total de cartes SIM
+      const totalSimCardsCount = await db.select({ count: count() })
+        .from(simCards)
+        .where(eq(simCards.userId, req.user.id));
+      
+      // Obtenir le nombre de cartes SIM disponibles
+      const availableSimCardsCount = await db.select({ count: count() })
+        .from(simCards)
+        .where(and(
+          eq(simCards.userId, req.user.id),
+          eq(simCards.statut, "disponible")
+        ));
+      
+      // Obtenir le nombre de cartes SIM activées
+      const assignedSimCardsCount = await db.select({ count: count() })
+        .from(simCards)
+        .where(and(
+          eq(simCards.userId, req.user.id),
+          eq(simCards.statut, "Activé")
+        ));
+      
+      // Get recent activities
+      const recentActivities = await db.select().from(activities)
+        .where(eq(activities.userId, req.user.id))
+        .orderBy(desc(activities.createdAt))
+        .limit(5);
+      
+      // Get upcoming tasks
+      const upcomingTasks = await db.select().from(tasks)
+        .where(and(
+          eq(tasks.userId, req.user.id),
+          eq(tasks.status, "en_cours")
+        ))
+        .orderBy(desc(tasks.createdAt))
+        .limit(5);
+      
+      // Récupérer les statistiques du module de recrutement
+      const totalRecruiters = await db.select({ count: count() }).from(recruiters);
+      const totalProspects = await db.select({ count: count() }).from(recruitmentProspects);
+      const activeProspects = await db.select({ count: count() })
+        .from(recruitmentProspects)
+        .where(eq(recruitmentProspects.stade, 'actif'));
+      
+      // Statistiques des prospects par étape
+      const stageStats = [];
+      const stages = await db.select().from(recruitmentStages).orderBy(asc(recruitmentStages.ordre));
+      
+      for (const stage of stages) {
+        const stageCount = await db.select({ count: count() })
+          .from(recruitmentProspects)
+          .where(eq(recruitmentProspects.stade, stage.nom.toLowerCase()));
+        
+        stageStats.push({
+          nom: stage.nom,
+          count: stageCount[0].count,
+          couleur: stage.couleur
+        });
+      }
+      
+      const stats = {
+        totalClients: totalClientsCount[0].count,
+        validationClients: validationClientsCount[0].count,
+        installationClients: installationClientsCount[0].count,
+        freeboxClients: freeboxClientsCount[0].count,
+        totalSimCards: totalSimCardsCount[0].count,
+        availableSimCards: availableSimCardsCount[0].count,
+        assignedSimCards: assignedSimCardsCount[0].count,
+        // Stats pour le module recrutement
+        totalRecruiters: totalRecruiters[0].count,
+        totalProspects: totalProspects[0].count,
+        activeProspects: activeProspects[0].count,
+        stageStats
+      };
+      
+      res.json({
+        stats,
+        recentActivities,
+        upcomingTasks
+      });
+    } catch (error) {
+      console.error("Erreur lors de la récupération des données du tableau de bord:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  // API Routes pour le module de recrutement
+  
+  // Routes pour les vendeurs (recruiters)
+  app.get("/api/recruiters", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      const { search, statut } = req.query;
+      
+      // Déterminer si l'utilisateur est un administrateur
+      const isAdmin = [1, 15].includes(req.user.id); // IDs des utilisateurs admin connus
+      
+      // Trouver si l'utilisateur actuel est un recruteur
+      const userRecruiter = isAdmin ? null : await db.query.recruiters.findFirst({
+        where: eq(recruiters.userId, req.user.id)
+      });
+      
+      let query = db.select().from(recruiters)
+        .orderBy(asc(recruiters.niveau))
+        .orderBy(asc(recruiters.nom));
+      
+      // Filtrer par statut si fourni
+      if (statut && typeof statut === 'string') {
+        query = query.where(eq(recruiters.statut, statut));
+      }
+      
+      // Appliquer les restrictions d'accès basées sur le rôle
+      if (!isAdmin && userRecruiter) {
+        // Si l'utilisateur est un vendeur, on récupère d'abord tous les recruteurs
+        let recruitersList = await query;
+        
+        // Récupérer tous les recruteurs directement recrutés par ce vendeur
+        const networkStructure = await db.select()
+          .from(recruitmentNetworkStructure)
+          .where(eq(recruitmentNetworkStructure.recruteParId, userRecruiter.id));
+        
+        const directRecruitIds = networkStructure.map(item => item.recruteurId);
+        
+        // Récupérer tous les recruteurs de niveau 2 (recrutés par les recrues de ce vendeur)
+        let level2RecruitIds: number[] = [];
+        for (const directId of directRecruitIds) {
+          const subRecruiters = await db.select()
+            .from(recruitmentNetworkStructure)
+            .where(eq(recruitmentNetworkStructure.recruteParId, directId));
+          
+          level2RecruitIds = [...level2RecruitIds, ...subRecruiters.map(item => item.recruteurId)];
+        }
+        
+        // Vendeur lui-même + ses recrues directes + les recrues de ses recrues
+        const allowedIds = [userRecruiter.id, ...directRecruitIds, ...level2RecruitIds];
+        
+        // Filtrer la liste manuellement
+        recruitersList = recruitersList.filter(recruiter => allowedIds.includes(recruiter.id));
+        
+        // Retourner la liste filtrée directement
+        return res.json(recruitersList);
+      }
+      
+      let recruitersList = await query;
+      
+      // Recherche par nom, prénom, email ou code vendeur
+      if (search && typeof search === 'string') {
+        const searchLower = search.toLowerCase();
+        const filteredResults = [];
+        
+        for (const recruiter of recruitersList) {
+          if (recruiter.nom.toLowerCase().includes(searchLower) ||
+              recruiter.prenom.toLowerCase().includes(searchLower) ||
+              recruiter.email.toLowerCase().includes(searchLower) ||
+              recruiter.codeVendeur.toLowerCase().includes(searchLower)) {
+            filteredResults.push(recruiter);
+          }
+        }
+        
+        recruitersList = filteredResults;
+      }
+      
+      // Pour chaque vendeur, récupérer le nombre de recrues directes
+      for (let i = 0; i < recruitersList.length; i++) {
+        const recruiter = recruitersList[i];
+        
+        // Nombre de recrutés directs
+        const directRecruits = await db.select({ count: count() })
+          .from(recruitmentNetworkStructure)
+          .where(and(
+            eq(recruitmentNetworkStructure.recruteParId, recruiter.id),
+            eq(recruitmentNetworkStructure.niveauHierarchique, 1)
+          ));
+        
+        // Nombre total de prospects
+        const prospectsCount = await db.select({ count: count() })
+          .from(recruitmentProspects)
+          .where(eq(recruitmentProspects.recruteurId, recruiter.id));
+        
+        // Mise à jour avec les compteurs
+        recruitersList[i] = {
+          ...recruiter,
+          directRecruits: directRecruits[0].count,
+          prospectsCount: prospectsCount[0].count
+        };
+      }
+      
+      res.json(recruitersList);
+    } catch (error) {
+      console.error("Erreur lors de la récupération des vendeurs:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+  
+  app.get("/api/recruiters/:id", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      const { id } = req.params;
+      const recruiterId = parseInt(id);
+      
+      if (isNaN(recruiterId)) {
+        return res.status(400).json({ message: "ID de vendeur invalide" });
+      }
+      
+      const recruiter = await db.query.recruiters.findFirst({
+        where: eq(recruiters.id, recruiterId),
+        with: {
+          user: true,
+          recruteur: true
+        }
+      });
+      
+      if (!recruiter) {
+        return res.status(404).json({ message: "Vendeur non trouvé" });
+      }
+      
+      // Récupérer les prospects de ce vendeur
+      const prospects = await db.select().from(recruitmentProspects)
+        .where(or(
+          eq(recruitmentProspects.recruteurId, recruiterId),
+          eq(recruitmentProspects.assigneA, recruiterId)
+        ))
+        .orderBy(desc(recruitmentProspects.updatedAt));
+      
+      // Récupérer les activités récentes de ce vendeur
+      const activities = await db.select().from(recruitmentActivities)
+        .where(eq(recruitmentActivities.recruteurId, recruiterId))
+        .orderBy(desc(recruitmentActivities.dateActivite))
+        .limit(10);
+      
+      // Récupérer les vendeurs recrutés directement
+      const directRecruits = await db.select({
+        recruiter: recruiters,
+        networkInfo: recruitmentNetworkStructure
+      })
+        .from(recruitmentNetworkStructure)
+        .where(and(
+          eq(recruitmentNetworkStructure.recruteParId, recruiterId),
+          eq(recruitmentNetworkStructure.niveauHierarchique, 1)
+        ))
+        .innerJoin(recruiters, eq(recruitmentNetworkStructure.recruteurId, recruiters.id))
+        .orderBy(desc(recruitmentNetworkStructure.dateRecrutement));
+      
+      const networkSize = await db.select({ count: count() })
+        .from(recruitmentNetworkStructure)
+        .where(eq(recruitmentNetworkStructure.recruteParId, recruiterId));
+      
+      const result = {
+        ...recruiter,
+        prospects,
+        activities,
+        directRecruits: directRecruits.map(dr => ({
+          ...dr.recruiter,
+          dateRecrutement: dr.networkInfo.dateRecrutement,
+          tauxCommission: dr.networkInfo.tauxCommission
+        })),
+        networkSize: networkSize[0].count
+      };
+      
+      res.json(result);
+    } catch (error) {
+      console.error("Erreur lors de la récupération du vendeur:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+  
+  app.post("/api/recruiters", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      const {
+        userId, codeVendeur, nom, prenom, email, telephone, 
+        dateNaissance, adresse, codePostal, ville, 
+        niveauExperience, niveau, commissionBase, 
+        avatar, description, competences, recruteurId
+      } = req.body;
+      
+      if (!userId || !codeVendeur || !nom || !prenom || !email || !telephone) {
+        return res.status(400).json({ message: "Tous les champs obligatoires doivent être remplis" });
+      }
+      
+      // Vérifier si l'utilisateur existe
+      const user = await db.query.users.findFirst({
+        where: eq(users.id, userId)
+      });
+      
+      if (!user) {
+        return res.status(404).json({ message: "Utilisateur non trouvé" });
+      }
+      
+      // Vérifier si le code vendeur est unique
+      const existingCodeVendeur = await db.query.recruiters.findFirst({
+        where: eq(recruiters.codeVendeur, codeVendeur)
+      });
+      
+      if (existingCodeVendeur) {
+        return res.status(400).json({ message: "Ce code vendeur est déjà utilisé" });
+      }
+      
+      // Vérifier si le recruteur existe s'il est fourni
+      if (recruteurId) {
+        const recruteur = await db.query.recruiters.findFirst({
+          where: eq(recruiters.id, recruteurId)
+        });
+        
+        if (!recruteur) {
+          return res.status(404).json({ message: "Recruteur parent non trouvé" });
+        }
+      }
+      
+      // Création du vendeur
+      const [newRecruiter] = await db.insert(recruiters).values({
+        userId,
+        codeVendeur,
+        nom,
+        prenom,
+        email,
+        telephone,
+        dateNaissance,
+        adresse,
+        codePostal,
+        ville,
+        niveauExperience,
+        niveau: niveau || 1,
+        commissionBase: commissionBase || 0,
+        avatar,
+        description,
+        competences: competences || [],
+        recruteurId,
+        statut: "actif",
+        dateActivation: new Date()
+      }).returning();
+      
+      // Si un recruteur parent est fourni, créer la relation dans la structure réseau
+      if (recruteurId) {
+        await db.insert(recruitmentNetworkStructure).values({
+          recruteurId: newRecruiter.id,
+          recruteParId: recruteurId,
+          niveauHierarchique: 1,
+          dateRecrutement: new Date(),
+          tauxCommission: 0 // À définir selon les règles métier
+        });
+        
+        // Ajouter une activité pour le recrutement
+        await db.insert(activities).values({
+          title: `Nouveau vendeur recruté : ${prenom} ${nom}`,
+          type: "Recrutement",
+          userId: req.user.id
+        });
+      }
+      
+      res.status(201).json(newRecruiter);
+    } catch (error) {
+      console.error("Erreur lors de la création du vendeur:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+  
+  app.put("/api/recruiters/:id", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      const { id } = req.params;
+      const recruiterId = parseInt(id);
+      
+      if (isNaN(recruiterId)) {
+        return res.status(400).json({ message: "ID de vendeur invalide" });
+      }
+      
+      const {
+        codeVendeur, nom, prenom, email, telephone, 
+        dateNaissance, adresse, codePostal, ville, 
+        niveauExperience, niveau, commissionBase, 
+        avatar, description, competences, statut
+      } = req.body;
+      
+      if (!codeVendeur || !nom || !prenom || !email || !telephone) {
+        return res.status(400).json({ message: "Tous les champs obligatoires doivent être remplis" });
+      }
+      
+      // Vérifier si le vendeur existe
+      const existingRecruiter = await db.query.recruiters.findFirst({
+        where: eq(recruiters.id, recruiterId)
+      });
+      
+      if (!existingRecruiter) {
+        return res.status(404).json({ message: "Vendeur non trouvé" });
+      }
+      
+      // Vérifier si le code vendeur est unique (s'il a été modifié)
+      if (codeVendeur !== existingRecruiter.codeVendeur) {
+        const existingCodeVendeur = await db.query.recruiters.findFirst({
+          where: and(
+            eq(recruiters.codeVendeur, codeVendeur),
+            not(eq(recruiters.id, recruiterId))
+          )
+        });
+        
+        if (existingCodeVendeur) {
+          return res.status(400).json({ message: "Ce code vendeur est déjà utilisé" });
+        }
+      }
+      
+      // Mise à jour du vendeur
+      const [updatedRecruiter] = await db.update(recruiters)
+        .set({
+          codeVendeur,
+          nom,
+          prenom,
+          email,
+          telephone,
+          dateNaissance,
+          adresse,
+          codePostal,
+          ville,
+          niveauExperience,
+          niveau,
+          commissionBase,
+          avatar,
+          description,
+          competences,
+          statut,
+          updatedAt: new Date()
+        })
+        .where(eq(recruiters.id, recruiterId))
+        .returning();
+      
+      // Ajouter une activité pour la mise à jour
+      await db.insert(activities).values({
+        title: `Vendeur mis à jour : ${prenom} ${nom}`,
+        type: "Recrutement",
+        userId: req.user.id
+      });
+      
+      res.json(updatedRecruiter);
+    } catch (error) {
+      console.error("Erreur lors de la mise à jour du vendeur:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+  
+  // Routes pour les prospects de recrutement
+  app.get("/api/recruitment/prospects", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      const { search, stade, recruteurId } = req.query;
+      
+      // Déterminer si l'utilisateur est un administrateur
+      const isAdmin = [1, 15].includes(req.user.id); // IDs des utilisateurs admin connus
+      
+      // Trouver si l'utilisateur actuel est un recruteur
+      const userRecruiter = await db.query.recruiters.findFirst({
+        where: eq(recruiters.userId, req.user.id)
+      });
+      
+      let query = db.select({
+        prospect: recruitmentProspects,
+        recruteur: recruiters
+      })
+      .from(recruitmentProspects)
+      .leftJoin(recruiters, eq(recruitmentProspects.recruteurId, recruiters.id))
+      .orderBy(desc(recruitmentProspects.updatedAt));
+      
+      // Appliquer les restrictions selon le rôle
+      if (!isAdmin) {
+        if (userRecruiter) {
+          // Un vendeur ne peut voir que ses propres prospects
+          query = query.where(or(
+            eq(recruitmentProspects.recruteurId, userRecruiter.id),
+            eq(recruitmentProspects.assigneA, userRecruiter.id)
+          ));
+        } else {
+          // Si l'utilisateur n'est ni admin ni vendeur, retourner une liste vide
+          return res.json([]);
+        }
+      }
+      
+      // Filtrer par stade si fourni
+      if (stade && typeof stade === 'string') {
+        query = query.where(eq(recruitmentProspects.stade, stade));
+      }
+      
+      // Filtrer par recruteur si fourni (seulement pour les admins)
+      if (recruteurId && typeof recruteurId === 'string' && isAdmin) {
+        const rId = parseInt(recruteurId);
+        if (!isNaN(rId)) {
+          query = query.where(or(
+            eq(recruitmentProspects.recruteurId, rId),
+            eq(recruitmentProspects.assigneA, rId)
+          ));
+        }
+      }
+      
+      const prospects = await query;
+      
+      // Recherche par nom, prénom, email ou téléphone
+      let filteredProspects = prospects;
+      if (search && typeof search === 'string') {
+        const searchLower = search.toLowerCase();
+        filteredProspects = prospects.filter(item => 
+          item.prospect.nom.toLowerCase().includes(searchLower) ||
+          item.prospect.prenom.toLowerCase().includes(searchLower) ||
+          item.prospect.email.toLowerCase().includes(searchLower) ||
+          item.prospect.telephone.toLowerCase().includes(searchLower)
+        );
+      }
+      
+      // Pour chaque prospect, récupérer les détails du recruteur assigné
+      const formattedProspects = [];
+      for (const item of filteredProspects) {
+        let assigneA = null;
+        if (item.prospect.assigneA) {
+          assigneA = await db.query.recruiters.findFirst({
+            where: eq(recruiters.id, item.prospect.assigneA)
+          });
+        }
+        
+        formattedProspects.push({
+          ...item.prospect,
+          recruteur: item.recruteur ? {
+            id: item.recruteur.id,
+            nom: item.recruteur.nom,
+            prenom: item.recruteur.prenom
+          } : null,
+          assigneA: assigneA ? {
+            id: assigneA.id,
+            nom: assigneA.nom,
+            prenom: assigneA.prenom
+          } : null
+        });
+      }
+      
+      // Statistiques par stade
+      const stades = ["nouveau", "contacté", "entretien", "formation", "actif", "refusé"];
+      const stats: Record<string, number> = {};
+      
+      for (const stade of stades) {
+        const stageCount = await db.select({ value: count() })
+          .from(recruitmentProspects)
+          .where(eq(recruitmentProspects.stade, stade));
+        
+        stats[stade] = stageCount[0].value || 0;
+      }
+      
+      const totalCount = await db.select({ value: count() })
+        .from(recruitmentProspects);
+      
+      stats["total"] = totalCount[0].value || 0;
+      
+      res.json({
+        prospects: formattedProspects,
+        stats
+      });
+    } catch (error) {
+      console.error("Erreur lors de la récupération des prospects:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+  
+  app.get("/api/recruitment/prospects/:id", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      const { id } = req.params;
+      const prospectId = parseInt(id);
+      
+      if (isNaN(prospectId)) {
+        return res.status(400).json({ message: "ID de prospect invalide" });
+      }
+      
+      const prospect = await db.query.recruitmentProspects.findFirst({
+        where: eq(recruitmentProspects.id, prospectId)
+      });
+      
+      if (!prospect) {
+        return res.status(404).json({ message: "Prospect non trouvé" });
+      }
+      
+      // Récupérer le recruteur
+      let recruteur = null;
+      if (prospect.recruteurId) {
+        recruteur = await db.query.recruiters.findFirst({
+          where: eq(recruiters.id, prospect.recruteurId)
+        });
+      }
+      
+      // Récupérer le recruteur assigné
+      let assigneA = null;
+      if (prospect.assigneA) {
+        assigneA = await db.query.recruiters.findFirst({
+          where: eq(recruiters.id, prospect.assigneA)
+        });
+      }
+      
+      // Récupérer les activités liées à ce prospect
+      const activities = await db.select().from(recruitmentActivities)
+        .where(eq(recruitmentActivities.prospectId, prospectId))
+        .orderBy(desc(recruitmentActivities.dateActivite));
+      
+      const result = {
+        ...prospect,
+        recruteur: recruteur ? {
+          id: recruteur.id,
+          nom: recruteur.nom,
+          prenom: recruteur.prenom
+        } : null,
+        assigneA: assigneA ? {
+          id: assigneA.id,
+          nom: assigneA.nom,
+          prenom: assigneA.prenom
+        } : null,
+        activities
+      };
+      
+      res.json(result);
+    } catch (error) {
+      console.error("Erreur lors de la récupération du prospect:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+  
+  app.post("/api/recruitment/prospects", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      const {
+        prenom, nom, email, telephone, codePostal, ville,
+        source, motivation, experiencePrecedente, disponibilite,
+        stade, notes, recruteurId, assigneA
+      } = req.body;
+      
+      if (!prenom || !nom || !email || !telephone || !source || !recruteurId) {
+        return res.status(400).json({ message: "Tous les champs obligatoires doivent être remplis" });
+      }
+      
+      // Vérifier si le recruteur existe
+      const recruteur = await db.query.recruiters.findFirst({
+        where: eq(recruiters.id, recruteurId)
+      });
+      
+      if (!recruteur) {
+        return res.status(404).json({ message: "Recruteur non trouvé" });
+      }
+      
+      // Vérifier si le recruteur assigné existe
+      if (assigneA) {
+        const recruteurAssigne = await db.query.recruiters.findFirst({
+          where: eq(recruiters.id, assigneA)
+        });
+        
+        if (!recruteurAssigne) {
+          return res.status(404).json({ message: "Recruteur assigné non trouvé" });
+        }
+      }
+      
+      // Création du prospect
+      const [newProspect] = await db.insert(recruitmentProspects).values({
+        prenom,
+        nom,
+        email,
+        telephone,
+        codePostal,
+        ville,
+        source,
+        motivation,
+        experiencePrecedente,
+        disponibilite,
+        stade: stade || "nouveau",
+        notes,
+        recruteurId,
+        assigneA
+      }).returning();
+      
+      // Ajouter une activité pour la création
+      await db.insert(recruitmentActivities).values({
+        type: "Enregistrement",
+        titre: "Nouveau prospect enregistré",
+        description: `Nouveau prospect ${prenom} ${nom} enregistré par ${recruteur.prenom} ${recruteur.nom}`,
+        dateActivite: new Date(),
+        prospectId: newProspect.id,
+        recruteurId: recruteurId
+      });
+      
+      res.status(201).json(newProspect);
+    } catch (error) {
+      console.error("Erreur lors de la création du prospect:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+  
+  app.put("/api/recruitment/prospects/:id", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      const { id } = req.params;
+      const prospectId = parseInt(id);
+      
+      if (isNaN(prospectId)) {
+        return res.status(400).json({ message: "ID de prospect invalide" });
+      }
+      
+      const {
+        prenom, nom, email, telephone, codePostal, ville,
+        source, motivation, experiencePrecedente, disponibilite,
+        stade, notes, assigneA
+      } = req.body;
+      
+      if (!prenom || !nom || !email || !telephone || !source) {
+        return res.status(400).json({ message: "Tous les champs obligatoires doivent être remplis" });
+      }
+      
+      // Vérifier si le prospect existe
+      const existingProspect = await db.query.recruitmentProspects.findFirst({
+        where: eq(recruitmentProspects.id, prospectId)
+      });
+      
+      if (!existingProspect) {
+        return res.status(404).json({ message: "Prospect non trouvé" });
+      }
+      
+      // Vérifier si le recruteur assigné existe
+      if (assigneA) {
+        const recruteurAssigne = await db.query.recruiters.findFirst({
+          where: eq(recruiters.id, assigneA)
+        });
+        
+        if (!recruteurAssigne) {
+          return res.status(404).json({ message: "Recruteur assigné non trouvé" });
+        }
+      }
+      
+      // Capturer l'ancien stade pour détecter les changements
+      const stadeChange = stade !== existingProspect.stade;
+      const oldStade = existingProspect.stade;
+      
+      // Mise à jour du prospect
+      const [updatedProspect] = await db.update(recruitmentProspects)
+        .set({
+          prenom,
+          nom,
+          email,
+          telephone,
+          codePostal,
+          ville,
+          source,
+          motivation,
+          experiencePrecedente,
+          disponibilite,
+          stade,
+          notes,
+          assigneA,
+          updatedAt: new Date()
+        })
+        .where(eq(recruitmentProspects.id, prospectId))
+        .returning();
+      
+      // Si le stade a changé, ajouter une activité spécifique
+      if (stadeChange) {
+        await db.insert(recruitmentActivities).values({
+          type: "Changement de stade",
+          titre: `Passage du stade "${oldStade}" à "${stade}"`,
+          description: `Le prospect est passé du stade "${oldStade}" au stade "${stade}"`,
+          dateActivite: new Date(),
+          prospectId: prospectId,
+          recruteurId: existingProspect.recruteurId
+        });
+      }
+      
+      res.json(updatedProspect);
+    } catch (error) {
+      console.error("Erreur lors de la mise à jour du prospect:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+  
+  // Routes pour les étapes de recrutement
+  app.get("/api/recruitment/stages", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      const stages = await db.select().from(recruitmentStages)
+        .orderBy(asc(recruitmentStages.ordre));
+      
+      // Pour chaque étape, compter le nombre de prospects
+      const stagesWithCounts = [];
+      for (const stage of stages) {
+        const prospectsCount = await db.select({ value: count() })
+          .from(recruitmentProspects)
+          .where(eq(recruitmentProspects.stade, stage.nom.toLowerCase()));
+        
+        stagesWithCounts.push({
+          ...stage,
+          prospectsCount: prospectsCount[0].value || 0
+        });
+      }
+      
+      res.json(stagesWithCounts);
+    } catch (error) {
+      console.error("Erreur lors de la récupération des étapes:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+  
+  app.post("/api/recruitment/stages", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      const { nom, description, couleur, ordre } = req.body;
+      
+      if (!nom || !couleur || ordre === undefined) {
+        return res.status(400).json({ message: "Tous les champs obligatoires doivent être remplis" });
+      }
+      
+      // Vérifier si un stade avec le même nom existe déjà
+      const existingStage = await db.query.recruitmentStages.findFirst({
+        where: eq(recruitmentStages.nom, nom)
+      });
+      
+      if (existingStage) {
+        return res.status(400).json({ message: "Une étape avec ce nom existe déjà" });
+      }
+      
+      // Création de l'étape
+      const [newStage] = await db.insert(recruitmentStages).values({
+        nom,
+        description,
+        couleur,
+        ordre
+      }).returning();
+      
+      res.status(201).json(newStage);
+    } catch (error) {
+      console.error("Erreur lors de la création de l'étape:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+  
+  app.put("/api/recruitment/stages/:id", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      const { id } = req.params;
+      const stageId = parseInt(id);
+      
+      if (isNaN(stageId)) {
+        return res.status(400).json({ message: "ID d'étape invalide" });
+      }
+      
+      const { nom, description, couleur, ordre } = req.body;
+      
+      if (!nom || !couleur || ordre === undefined) {
+        return res.status(400).json({ message: "Tous les champs obligatoires doivent être remplis" });
+      }
+      
+      // Vérifier si l'étape existe
+      const existingStage = await db.query.recruitmentStages.findFirst({
+        where: eq(recruitmentStages.id, stageId)
+      });
+      
+      if (!existingStage) {
+        return res.status(404).json({ message: "Étape non trouvée" });
+      }
+      
+      // Vérifier si un stade avec le même nom existe déjà (autre que celui en cours de modification)
+      const duplicateStage = await db.query.recruitmentStages.findFirst({
+        where: and(
+          eq(recruitmentStages.nom, nom),
+          eq(recruitmentStages.id, stageId).not()
+        )
+      });
+      
+      if (duplicateStage) {
+        return res.status(400).json({ message: "Une étape avec ce nom existe déjà" });
+      }
+      
+      // Mise à jour de l'étape
+      const [updatedStage] = await db.update(recruitmentStages)
+        .set({
+          nom,
+          description,
+          couleur,
+          ordre
+        })
+        .where(eq(recruitmentStages.id, stageId))
+        .returning();
+      
+      res.json(updatedStage);
+    } catch (error) {
+      console.error("Erreur lors de la mise à jour de l'étape:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+  
+  // Routes pour les activités de recrutement
+  app.get("/api/recruitment/activities", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      const { prospectId, recruteurId, type, startDate, endDate } = req.query;
+      
+      let query = db.select().from(recruitmentActivities)
+        .orderBy(desc(recruitmentActivities.dateActivite));
+      
+      // Filtrer par prospect si fourni
+      if (prospectId && typeof prospectId === 'string') {
+        const pId = parseInt(prospectId);
+        if (!isNaN(pId)) {
+          query = query.where(eq(recruitmentActivities.prospectId, pId));
+        }
+      }
+      
+      // Filtrer par recruteur si fourni
+      if (recruteurId && typeof recruteurId === 'string') {
+        const rId = parseInt(recruteurId);
+        if (!isNaN(rId)) {
+          query = query.where(eq(recruitmentActivities.recruteurId, rId));
+        }
+      }
+      
+      // Filtrer par type si fourni
+      if (type && typeof type === 'string') {
+        query = query.where(eq(recruitmentActivities.type, type));
+      }
+      
+      // Filtrer par plage de dates si fourni
+      if (startDate && typeof startDate === 'string' && endDate && typeof endDate === 'string') {
+        const start = new Date(startDate);
+        const end = new Date(endDate);
+        
+        if (!isNaN(start.getTime()) && !isNaN(end.getTime())) {
+          query = query.where(and(
+            eq(recruitmentActivities.dateActivite, start).gte(),
+            eq(recruitmentActivities.dateActivite, end).lte()
+          ));
+        }
+      }
+      
+      const activities = await query;
+      
+      // Pour chaque activité, récupérer les détails du prospect et du recruteur
+      const activitiesWithDetails = [];
+      
+      for (const activity of activities) {
+        let prospect = null;
+        let recruteur = null;
+        
+        if (activity.prospectId) {
+          prospect = await db.query.recruitmentProspects.findFirst({
+            where: eq(recruitmentProspects.id, activity.prospectId)
+          });
+        }
+        
+        if (activity.recruteurId) {
+          recruteur = await db.query.recruiters.findFirst({
+            where: eq(recruiters.id, activity.recruteurId)
+          });
+        }
+        
+        activitiesWithDetails.push({
+          ...activity,
+          prospect: prospect ? {
+            id: prospect.id,
+            nom: prospect.nom,
+            prenom: prospect.prenom
+          } : null,
+          recruteur: recruteur ? {
+            id: recruteur.id,
+            nom: recruteur.nom,
+            prenom: recruteur.prenom
+          } : null
+        });
+      }
+      
+      res.json(activitiesWithDetails);
+    } catch (error) {
+      console.error("Erreur lors de la récupération des activités:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+  
+  app.post("/api/recruitment/activities", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      const {
+        type, titre, description, dateActivite, duree,
+        resultat, notes, prospectId, stadeId, recruteurId
+      } = req.body;
+      
+      if (!type || !titre || !dateActivite || !prospectId || !recruteurId) {
+        return res.status(400).json({ message: "Tous les champs obligatoires doivent être remplis" });
+      }
+      
+      // Vérifier si le prospect existe
+      const prospect = await db.query.recruitmentProspects.findFirst({
+        where: eq(recruitmentProspects.id, prospectId)
+      });
+      
+      if (!prospect) {
+        return res.status(404).json({ message: "Prospect non trouvé" });
+      }
+      
+      // Vérifier si le recruteur existe
+      const recruteur = await db.query.recruiters.findFirst({
+        where: eq(recruiters.id, recruteurId)
+      });
+      
+      if (!recruteur) {
+        return res.status(404).json({ message: "Recruteur non trouvé" });
+      }
+      
+      // Vérifier si le stade existe (si fourni)
+      if (stadeId) {
+        const stade = await db.query.recruitmentStages.findFirst({
+          where: eq(recruitmentStages.id, stadeId)
+        });
+        
+        if (!stade) {
+          return res.status(404).json({ message: "Étape non trouvée" });
+        }
+      }
+      
+      // Création de l'activité
+      const [newActivity] = await db.insert(recruitmentActivities).values({
+        type,
+        titre,
+        description,
+        dateActivite: new Date(dateActivite),
+        duree,
+        resultat,
+        notes,
+        prospectId,
+        stadeId,
+        recruteurId
+      }).returning();
+      
+      // Mettre à jour le stade du prospect si type d'activité est "Changement de stade"
+      if (type === "Changement de stade" && stadeId) {
+        const stade = await db.query.recruitmentStages.findFirst({
+          where: eq(recruitmentStages.id, stadeId)
+        });
+        
+        if (stade) {
+          await db.update(recruitmentProspects)
+            .set({
+              stade: stade.nom.toLowerCase(),
+              updatedAt: new Date()
+            })
+            .where(eq(recruitmentProspects.id, prospectId));
+        }
+      }
+      
+      res.status(201).json(newActivity);
+    } catch (error) {
+      console.error("Erreur lors de la création de l'activité:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  // Routes pour les analyses de recrutement
+  app.get("/api/recruitment/analytics", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      // 1. Données sur les prospects par stade
+      const stades = ["nouveau", "contacté", "entretien", "formation", "actif", "refusé"];
+      const prospectsByStage: Record<string, number> = {};
+      
+      for (const stade of stades) {
+        const countResult = await db.select({ value: count() })
+          .from(recruitmentProspects)
+          .where(eq(recruitmentProspects.stade, stade));
+        
+        prospectsByStage[stade] = countResult[0].value || 0;
+      }
+      
+      // 2. Données sur les prospects par source
+      const sources = ["site_web", "réseaux_sociaux", "recommandation", "salon", "cold_calling", "autre"];
+      const prospectsBySource: Record<string, number> = {};
+      
+      for (const source of sources) {
+        const countResult = await db.select({ value: count() })
+          .from(recruitmentProspects)
+          .where(eq(recruitmentProspects.source, source));
+        
+        prospectsBySource[source] = countResult[0].value || 0;
+      }
+      
+      // 3. Évolution des prospects dans le temps (30 derniers jours)
+      const today = new Date();
+      const thirtyDaysAgo = new Date(today);
+      thirtyDaysAgo.setDate(today.getDate() - 30);
+      
+      const prospectsTimeline = [];
+      
+      for (let i = 0; i < 30; i++) {
+        const date = new Date(thirtyDaysAgo);
+        date.setDate(date.getDate() + i);
+        
+        // Format date to YYYY-MM-DD for comparison
+        const formattedDate = date.toISOString().split('T')[0];
+        const nextDay = new Date(date);
+        nextDay.setDate(date.getDate() + 1);
+        const formattedNextDay = nextDay.toISOString().split('T')[0];
+        
+        const countResult = await db.select({ value: count() })
+          .from(recruitmentProspects)
+          .where(
+            and(
+              gte(recruitmentProspects.createdAt, new Date(formattedDate)),
+              lt(recruitmentProspects.createdAt, new Date(formattedNextDay))
+            )
+          );
+        
+        prospectsTimeline.push({
+          date: formattedDate,
+          count: countResult[0].value || 0
+        });
+      }
+      
+      // 4. Performances des recruteurs
+      const recruitersRaw = await db.select().from(recruiters);
+      const recruitersPerformance = [];
+      
+      for (const recruteur of recruitersRaw) {
+        // Total des prospects pour ce recruteur
+        const totalProspectsResult = await db.select({ value: count() })
+          .from(recruitmentProspects)
+          .where(eq(recruitmentProspects.recruteurId, recruteur.id));
+        
+        // Prospects convertis (stade "actif")
+        const convertedProspectsResult = await db.select({ value: count() })
+          .from(recruitmentProspects)
+          .where(
+            and(
+              eq(recruitmentProspects.recruteurId, recruteur.id),
+              eq(recruitmentProspects.stade, "actif")
+            )
+          );
+        
+        const prospectsCount = totalProspectsResult[0].value || 0;
+        const conversionRate = prospectsCount > 0 
+          ? Math.round((convertedProspectsResult[0].value || 0) / prospectsCount * 100) 
+          : 0;
+        
+        recruitersPerformance.push({
+          id: recruteur.id,
+          nom: recruteur.nom,
+          prenom: recruteur.prenom,
+          prospectsCount,
+          conversionRate
+        });
+      }
+      
+      // 5. Taux de conversion entre stades
+      const conversionRates = [];
+      const stagesCombinations = [
+        { from: "nouveau", to: "contacté" },
+        { from: "contacté", to: "entretien" },
+        { from: "entretien", to: "formation" },
+        { from: "formation", to: "actif" }
+      ];
+      
+      for (const { from, to } of stagesCombinations) {
+        const fromCount = prospectsByStage[from] || 0;
+        const toCount = prospectsByStage[to] || 0;
+        
+        // Si le stade précédent a 0 prospects, le taux est 0
+        const rate = fromCount > 0 ? Math.round((toCount / fromCount) * 100) : 0;
+        
+        conversionRates.push({
+          stageFrom: from,
+          stageTo: to,
+          rate
+        });
+      }
+      
+      // 6. Top performers (classement des recruteurs)
+      const topPerformers = [...recruitersPerformance]
+        .sort((a, b) => (b.prospectsCount * b.conversionRate) - (a.prospectsCount * a.conversionRate))
+        .slice(0, 5)
+        .map(recruiter => ({
+          id: recruiter.id,
+          nom: recruiter.nom,
+          prenom: recruiter.prenom,
+          performance: Math.round((recruiter.prospectsCount * recruiter.conversionRate) / 100) // Indicateur de performance
+        }));
+      
+      res.json({
+        prospectsByStage,
+        prospectsBySource,
+        prospectsTimeline,
+        recruitersPerformance,
+        conversionRates,
+        topPerformers
+      });
+    } catch (error) {
+      console.error("Erreur lors de la récupération des analyses:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  // Routes pour le tunnel de recrutement
+  // Récupérer les informations du prospect courant pour l'utilisateur connecté
+  app.get("/api/recruitment/prospects/current", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      console.log("=== DEBUG PROSPECT CURRENT ===");
+      console.log(`Utilisateur ID: ${req.user.id}, Username: ${req.user.username}`);
+      
+      // Vérifier si l'utilisateur est un recruteur
+      let recruteur = await db.query.recruiters.findFirst({
+        where: eq(recruiters.userId, req.user.id)
+      });
+
+      console.log("Recruteur trouvé:", recruteur ? `ID: ${recruteur.id}` : "Non trouvé");
+
+      // Si l'utilisateur n'est pas un recruteur, créer un profil recruteur pour lui
+      if (!recruteur) {
+        console.log(`Création d'un profil recruteur pour l'utilisateur ${req.user.id}`);
+        
+        // Générer un code vendeur unique
+        const codeVendeur = `FR${Math.floor(10000000 + Math.random() * 90000000)}`;
+        console.log(`Code vendeur généré: ${codeVendeur}`);
+        
+        // Créer un profil recruteur basique
+        const username = req.user.username;
+        const prenom = username.split('@')[0]; // Utiliser la partie avant @ comme prénom
+        
+        try {
+          console.log("Tentative d'insertion du recruteur avec données:", {
+            userId: req.user.id,
+            nom: "Utilisateur",
+            prenom,
+            email: username,
+            codeVendeur
+          });
+          
+          const [newRecruteur] = await db.insert(recruiters).values({
+            userId: req.user.id,
+            nom: "Utilisateur",
+            prenom: prenom,
+            email: username,
+            telephone: "",
+            codeVendeur,
+            niveau: 1,
+            statut: "actif",
+            niveauExperience: "debutant",
+            commissionBase: 5
+          }).returning();
+          
+          console.log("Recruteur créé avec succès:", newRecruteur ? `ID: ${newRecruteur.id}` : "Erreur: pas de recruteur retourné");
+          recruteur = newRecruteur;
+        } catch (err) {
+          console.error("ERREUR lors de la création du recruteur:", err);
+        }
+      }
+      
+      // S'assurer que le recruteur existe après avoir essayé de le créer
+      if (!recruteur) {
+        return res.status(500).json({ message: "Impossible de créer ou récupérer le profil recruteur" });
+      }
+      
+      // Vérifier si l'utilisateur a un prospect en cours (lui-même)
+      console.log(`Recherche d'un prospect pour le recruteur ID: ${recruteur.id}`);
+      
+      const prospect = await db.query.recruitmentProspects.findFirst({
+        where: eq(recruitmentProspects.recruteurId, recruteur.id),
+        orderBy: desc(recruitmentProspects.createdAt)
+      });
+
+      console.log("Prospect trouvé:", prospect ? `ID: ${prospect.id}` : "Non trouvé");
+
+      if (!prospect) {
+        // Créer un nouveau prospect si aucun n'existe
+        console.log("Création d'un nouveau prospect pour le recruteur", {
+          nom: recruteur.nom,
+          prenom: recruteur.prenom,
+          email: recruteur.email,
+          recruteurId: recruteur.id
+        });
+        
+        try {
+          const newProspect = await db.insert(recruitmentProspects).values({
+            prenom: recruteur.prenom,
+            nom: recruteur.nom,
+            email: recruteur.email,
+            telephone: recruteur.telephone,
+            codePostal: recruteur.codePostal || "",
+            ville: recruteur.ville || "",
+            source: "interne",
+            stade: "formation",
+            recruteurId: recruteur.id,
+            formationCompletee: false,
+            formulaireComplete: false,
+            pieceIdentiteDeposee: false,
+            ribDepose: false,
+            contratGenere: false,
+            contratSigne: false
+          }).returning();
+          
+          console.log("Nouveau prospect créé avec succès:", newProspect[0] ? `ID: ${newProspect[0].id}` : "Erreur: pas de prospect retourné");
+          return res.json(newProspect[0]);
+        } catch (err) {
+          console.error("ERREUR lors de la création du prospect:", err);
+          return res.status(500).json({ message: "Impossible de créer un nouveau prospect" });
+        }
+      }
+
+      res.json(prospect);
+    } catch (error) {
+      console.error("Erreur lors de la récupération du prospect actuel:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  // Mettre à jour le statut de formation d'un prospect
+  app.put("/api/recruitment/prospects/formation-status", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      const { scoreQuiz, formationCompletee } = req.body;
+      
+      const userId = req.user.id; // Récupérer de manière sûre l'ID de l'utilisateur
+      console.log(`=== DEBUG FORMATION STATUS ===`);
+      console.log(`Mise à jour du statut de formation pour l'utilisateur ${userId}`);
+      console.log(`Score quiz: ${scoreQuiz}, Formation complétée: ${formationCompletee}`);
+      
+      // Vérifier si l'utilisateur est un recruteur
+      let recruteur = await db.query.recruiters.findFirst({
+        where: eq(recruiters.userId, userId)
+      });
+      
+      console.log("Recruteur trouvé:", recruteur ? `ID: ${recruteur.id}` : "Non trouvé");
+
+      // Si l'utilisateur n'est pas un recruteur, tenter de créer un profil recruteur
+      if (!recruteur) {
+        console.log(`Tentative de création d'un profil recruteur pour l'utilisateur ${userId}`);
+        
+        // Générer un code vendeur unique
+        const codeVendeur = `FR${Math.floor(10000000 + Math.random() * 90000000)}`;
+        
+        // Créer un profil recruteur basique
+        const username = req.user.username;
+        const prenom = username.split('@')[0]; // Utiliser la partie avant @ comme prénom
+        
+        try {
+          const [newRecruteur] = await db.insert(recruiters).values({
+            userId: userId,
+            nom: "Utilisateur",
+            prenom: prenom,
+            email: username,
+            telephone: "",
+            codeVendeur,
+            niveau: 1,
+            statut: "actif",
+            niveauExperience: "debutant",
+            commissionBase: 5
+          }).returning();
+          
+          recruteur = newRecruteur;
+        } catch (err) {
+          console.error("Erreur lors de la création du profil recruteur:", err);
+          return res.status(500).json({ message: "Impossible de créer un profil recruteur" });
+        }
+      }
+      
+      // S'assurer que le recruteur existe
+      if (!recruteur) {
+        return res.status(404).json({ message: "Profil de recruteur non trouvé ou impossible à créer" });
+      }
+
+      // Trouver le prospect associé
+      const prospect = await db.query.recruitmentProspects.findFirst({
+        where: eq(recruitmentProspects.recruteurId, recruteur.id),
+        orderBy: desc(recruitmentProspects.createdAt)
+      });
+
+      if (!prospect) {
+        return res.status(404).json({ message: "Prospect non trouvé" });
+      }
+
+      // Mettre à jour le statut de formation
+      const updatedProspect = await db.update(recruitmentProspects)
+        .set({
+          formationCompletee: formationCompletee,
+          scoreQuiz: scoreQuiz,
+          dateFormation: new Date(),
+          stade: formationCompletee ? "formulaire" : "formation"
+        })
+        .where(eq(recruitmentProspects.id, prospect.id))
+        .returning();
+
+      // Ajouter une activité de formation
+      await db.insert(recruitmentActivities).values({
+        type: "formation",
+        titre: "Formation complétée",
+        description: `Formation complétée avec un score de ${scoreQuiz}%`,
+        dateActivite: new Date(),
+        resultat: formationCompletee ? "positif" : "à suivre",
+        prospectId: prospect.id,
+        recruteurId: recruteur.id
+      });
+
+      res.json(updatedProspect[0]);
+    } catch (error) {
+      console.error("Erreur lors de la mise à jour du statut de formation:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  // Soumettre le formulaire de recrutement avec les documents
+  app.post("/api/recruitment/prospects/submit-form", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      // Cette endpoint devrait traiter l'upload de fichiers (pieceIdentite et rib)
+      // Dans une implémentation réelle, vous utiliseriez multer ou un autre middleware pour gérer les fichiers
+      const { adresse, codePostal, ville } = req.body;
+
+      // Vérifier si l'utilisateur est un recruteur
+      const recruteur = await db.query.recruiters.findFirst({
+        where: eq(recruiters.userId, req.user.id)
+      });
+
+      if (!recruteur) {
+        return res.status(404).json({ message: "Profil de recruteur non trouvé" });
+      }
+
+      // Trouver le prospect associé
+      const prospect = await db.query.recruitmentProspects.findFirst({
+        where: eq(recruitmentProspects.recruteurId, recruteur.id),
+        orderBy: desc(recruitmentProspects.createdAt)
+      });
+
+      if (!prospect) {
+        return res.status(404).json({ message: "Prospect non trouvé" });
+      }
+
+      // Mettre à jour les informations du formulaire
+      const updatedProspect = await db.update(recruitmentProspects)
+        .set({
+          codePostal,
+          ville,
+          formulaireComplete: true,
+          pieceIdentiteDeposee: true,
+          ribDepose: true,
+          stade: "contrat",
+          updatedAt: new Date()
+        })
+        .where(eq(recruitmentProspects.id, prospect.id))
+        .returning();
+
+      // Pour l'instant, nous simulons le stockage des documents
+      // Ajouter des entrées dans la base de données pour les documents
+      // Dans une implémentation complète, nous utiliserions multer pour gérer les fichiers
+      
+      // Simuler l'enregistrement de la pièce d'identité
+      await db.insert(recruitmentDocuments).values({
+        type: DOCUMENT_TYPES.PIECE_IDENTITE,
+        nomFichier: "piece_identite.jpg",
+        cheminFichier: `/uploads/prospects/${prospect.id}/piece_identite.jpg`, 
+        tailleFichier: 150000, // Taille simulée en octets
+        prospectId: prospect.id,
+        uploadedById: req.user.id
+      });
+      
+      // Simuler l'enregistrement du RIB
+      await db.insert(recruitmentDocuments).values({
+        type: DOCUMENT_TYPES.RIB,
+        nomFichier: "rib.pdf",
+        cheminFichier: `/uploads/prospects/${prospect.id}/rib.pdf`,
+        tailleFichier: 80000, // Taille simulée en octets
+        prospectId: prospect.id,
+        uploadedById: req.user.id
+      });
+      
+      // Si l'adresse est fournie, simuler un justificatif de domicile
+      if (adresse) {
+        await db.insert(recruitmentDocuments).values({
+          type: DOCUMENT_TYPES.JUSTIFICATIF_DOMICILE,
+          nomFichier: "justificatif_domicile.pdf",
+          cheminFichier: `/uploads/prospects/${prospect.id}/justificatif_domicile.pdf`,
+          tailleFichier: 120000, // Taille simulée en octets
+          prospectId: prospect.id,
+          uploadedById: req.user.id
+        });
+      }
+
+      // Ajouter une activité pour le formulaire complété
+      await db.insert(recruitmentActivities).values({
+        type: "formulaire",
+        titre: "Formulaire complété",
+        description: "Formulaire de recrutement et documents soumis",
+        dateActivite: new Date(),
+        resultat: "positif",
+        prospectId: prospect.id,
+        recruteurId: recruteur.id
+      });
+
+      // Aussi mettre à jour les informations du recruteur
+      await db.update(recruiters)
+        .set({
+          adresse,
+          codePostal,
+          ville,
+          updatedAt: new Date()
+        })
+        .where(eq(recruiters.id, recruteur.id));
+
+      res.json(updatedProspect[0]);
+    } catch (error) {
+      console.error("Erreur lors de la soumission du formulaire:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  // Soumettre le contrat signé
+  app.post("/api/recruitment/prospects/submit-contract", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      // Vérifier si l'utilisateur est un recruteur
+      const recruteur = await db.query.recruiters.findFirst({
+        where: eq(recruiters.userId, req.user.id)
+      });
+
+      if (!recruteur) {
+        return res.status(404).json({ message: "Profil de recruteur non trouvé" });
+      }
+
+      // Trouver le prospect associé
+      const prospect = await db.query.recruitmentProspects.findFirst({
+        where: eq(recruitmentProspects.recruteurId, recruteur.id),
+        orderBy: desc(recruitmentProspects.createdAt)
+      });
+      
+      if (!prospect) {
+        return res.status(404).json({ message: "Prospect non trouvé" });
+      }
+      
+      // Dans un cas réel, on gérerait l'upload du contrat signé ici
+      // Pour l'instant, nous simulons l'enregistrement du contrat signé
+      await db.insert(recruitmentDocuments).values({
+        type: DOCUMENT_TYPES.CONTRAT_SIGNE,
+        nomFichier: "contrat_signe.pdf",
+        cheminFichier: `/uploads/prospects/${prospect.id}/contrat_signe.pdf`,
+        tailleFichier: 250000, // Taille simulée en octets
+        prospectId: prospect.id,
+        uploadedById: req.user.id
+      });
+
+      // Mettre à jour les informations du contrat
+      const updatedProspect = await db.update(recruitmentProspects)
+        .set({
+          contratSigne: true,
+          dateSignatureContrat: new Date(),
+          stade: "actif",
+          updatedAt: new Date()
+        })
+        .where(eq(recruitmentProspects.id, prospect.id))
+        .returning();
+
+      // Ajouter une activité pour le contrat signé
+      await db.insert(recruitmentActivities).values({
+        type: "contrat",
+        titre: "Contrat signé",
+        description: "Contrat de recrutement signé et validé",
+        dateActivite: new Date(),
+        resultat: "positif",
+        prospectId: prospect.id,
+        recruteurId: recruteur.id
+      });
+
+      // Mettre à jour le statut du recruteur à actif
+      await db.update(recruiters)
+        .set({
+          statut: "actif",
+          dateActivation: new Date(),
+          updatedAt: new Date()
+        })
+        .where(eq(recruiters.id, recruteur.id));
+
+      res.json(updatedProspect[0]);
+    } catch (error) {
+      console.error("Erreur lors de la soumission du contrat:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  // Endpoint pour générer le contrat
+  app.post("/api/recruitment/prospects/generate-contract", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      // Vérifier si l'utilisateur est un recruteur
+      const recruteur = await db.query.recruiters.findFirst({
+        where: eq(recruiters.userId, req.user.id)
+      });
+
+      if (!recruteur) {
+        return res.status(404).json({ message: "Profil de recruteur non trouvé" });
+      }
+
+      // Trouver le prospect associé
+      const prospect = await db.query.recruitmentProspects.findFirst({
+        where: eq(recruitmentProspects.recruteurId, recruteur.id),
+        orderBy: desc(recruitmentProspects.createdAt)
+      });
+
+      if (!prospect) {
+        return res.status(404).json({ message: "Prospect non trouvé" });
+      }
+      
+      // Importer la fonction de génération de contrat
+      const { generateContratHTML } = await import("../client/src/lib/document-templates");
+      
+      // Générer le contenu HTML du contrat avec les données du prospect
+      const contratHTML = generateContratHTML({
+        nom: prospect.nom,
+        prenom: prospect.prenom,
+        adresse: prospect.adresse || "",
+        codePostal: prospect.codePostal || "",
+        ville: prospect.ville || "",
+        nomSociete: prospect.nomSociete || `${prospect.prenom} ${prospect.nom}`,
+        siret: prospect.siret || "",
+        codeVendeur: prospect.codeVendeur || ""
+      });
+      
+      // Taille réelle du contenu
+      const tailleFichier = Buffer.byteLength(contratHTML, 'utf8');
+      const nomFichier = `contrat_${prospect.nom.toLowerCase()}_${prospect.prenom.toLowerCase()}.html`;
+      
+      // Enregistrer le contrat dans la base de données
+      const [document] = await db.insert(recruitmentDocuments).values({
+        type: DOCUMENT_TYPES.CONTRAT_VIERGE,
+        nomFichier,
+        contenuDocument: contratHTML,
+        tailleFichier,
+        prospectId: prospect.id,
+        uploadedById: req.user.id,
+        dateUpload: new Date()
+      }).returning();
+
+      // Mettre à jour le statut pour indiquer que le contrat a été généré
+      const updatedProspect = await db.update(recruitmentProspects)
+        .set({
+          contratGenere: true,
+          updatedAt: new Date()
+        })
+        .where(eq(recruitmentProspects.id, prospect.id))
+        .returning();
+
+      // Ajouter une activité pour la génération de contrat
+      await db.insert(recruitmentActivities).values({
+        type: "contrat",
+        titre: "Contrat généré",
+        description: "Contrat de recrutement généré et prêt à être signé",
+        dateActivite: new Date(),
+        resultat: "en attente",
+        prospectId: prospect.id,
+        recruteurId: recruteur.id
+      });
+
+      res.json({
+        prospect: updatedProspect[0],
+        document
+      });
+    } catch (error) {
+      console.error("Erreur lors de la génération du contrat:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  // Récupérer les documents d'un prospect
+  app.get("/api/recruitment/prospects/:id/documents", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      const { id } = req.params;
+      const prospectId = parseInt(id);
+      
+      if (isNaN(prospectId)) {
+        return res.status(400).json({ message: "ID prospect invalide" });
+      }
+      
+      // Vérifier si l'utilisateur a les droits sur ce prospect
+      const recruteur = await db.query.recruiters.findFirst({
+        where: eq(recruiters.userId, req.user.id)
+      });
+      
+      if (!recruteur) {
+        return res.status(403).json({ message: "Accès non autorisé" });
+      }
+      
+      // Récupérer le prospect pour vérifier l'accès
+      const prospect = await db.query.recruitmentProspects.findFirst({
+        where: eq(recruitmentProspects.id, prospectId)
+      });
+      
+      if (!prospect) {
+        return res.status(404).json({ message: "Prospect non trouvé" });
+      }
+      
+      // Vérifier que ce prospect est bien lié au recruteur connecté
+      if (prospect.recruteurId !== recruteur.id) {
+        return res.status(403).json({ message: "Vous n'avez pas accès à ce prospect" });
+      }
+      
+      // Récupérer tous les documents associés au prospect
+      const documents = await db.select().from(recruitmentDocuments)
+        .where(eq(recruitmentDocuments.prospectId, prospectId))
+        .orderBy(desc(recruitmentDocuments.createdAt));
+      
+      res.json(documents);
+    } catch (error) {
+      console.error("Erreur lors de la récupération des documents:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+  
+  // Récupérer un document spécifique
+  app.get("/api/recruitment/documents/:id", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      const { id } = req.params;
+      const documentId = parseInt(id);
+      
+      if (isNaN(documentId)) {
+        return res.status(400).json({ message: "ID document invalide" });
+      }
+      
+      // Récupérer le document
+      const document = await db.query.recruitmentDocuments.findFirst({
+        where: eq(recruitmentDocuments.id, documentId)
+      });
+      
+      if (!document) {
+        return res.status(404).json({ message: "Document non trouvé" });
+      }
+      
+      // Vérifier si l'utilisateur a les droits sur ce document via le recruteur
+      const recruteur = await db.query.recruiters.findFirst({
+        where: eq(recruiters.userId, req.user.id)
+      });
+      
+      if (!recruteur) {
+        return res.status(403).json({ message: "Accès non autorisé" });
+      }
+      
+      // Vérifier que le recruteur a accès à ce prospect/document
+      const prospectDetails = await db.query.recruitmentProspects.findFirst({
+        where: eq(recruitmentProspects.id, document.prospectId)
+      });
+      
+      if (!prospectDetails || prospectDetails.recruteurId !== recruteur.id) {
+        return res.status(403).json({ message: "Vous n'avez pas accès à ce document" });
+      }
+      
+      // Dans une implémentation réelle, nous renverrions le fichier
+      // Pour l'instant, on renvoie juste les métadonnées
+      res.json({
+        ...document,
+        url: `/api/files${document.cheminFichier}` // URL simulée pour accéder au fichier
+      });
+    } catch (error) {
+      console.error("Erreur lors de la récupération du document:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  // Endpoint pour générer l'attestation de formation et l'attestation sur l'honneur
+  app.post("/api/recruitment/prospects/generate-attestation", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      let { prospectId } = req.body;
+      
+      // Si l'ID du prospect n'est pas fourni, chercher le prospect pour l'utilisateur actuel
+      if (!prospectId) {
+        // Vérifier si l'utilisateur est un recruteur
+        const recruteur = await db.query.recruiters.findFirst({
+          where: eq(recruiters.userId, req.user.id)
+        });
+
+        if (!recruteur) {
+          return res.status(404).json({ message: "Profil de recruteur non trouvé" });
+        }
+
+        // Trouver le prospect associé au recruteur connecté
+        const userProspect = await db.query.recruitmentProspects.findFirst({
+          where: eq(recruitmentProspects.recruteurId, recruteur.id),
+          orderBy: desc(recruitmentProspects.createdAt)
+        });
+        
+        if (!userProspect) {
+          return res.status(404).json({ message: "Prospect non trouvé pour cet utilisateur" });
+        }
+        
+        prospectId = userProspect.id;
+      }
+      
+      // Récupérer le prospect
+      const prospect = await db.query.recruitmentProspects.findFirst({
+        where: eq(recruitmentProspects.id, prospectId)
+      });
+      
+      if (!prospect) {
+        return res.status(404).json({ message: "Prospect non trouvé" });
+      }
+      
+      // Vérifier si la formation a bien été complétée
+      if (!prospect.formationCompletee || !prospect.scoreQuiz || prospect.scoreQuiz < 80) {
+        return res.status(400).json({ 
+          message: "Le prospect n'a pas complété la formation avec un score suffisant" 
+        });
+      }
+
+      // Générer le contenu HTML de l'attestation
+      const dateFormation = prospect.dateFormation 
+        ? new Date(prospect.dateFormation).toLocaleDateString('fr-FR') 
+        : new Date().toLocaleDateString('fr-FR');
+      
+      const dateAttestation = new Date().toLocaleDateString('fr-FR');
+      const scoreQuiz = prospect.scoreQuiz;
+      const nomComplet = `${prospect.prenom} ${prospect.nom}`;
+      
+      // Importer les fonctions de génération de documents
+      const { generateAttestationHTML, generateAttestationSurHonneurHTML } = await import("../client/src/lib/document-templates");
+      
+      // Générer l'attestation de formation
+      const attestationFormationHTML = generateAttestationHTML(
+        prospect.nom,
+        prospect.prenom,
+        dateFormation,
+        dateAttestation
+      );
+      
+      // Générer aussi l'attestation sur l'honneur
+      const attestationSurHonneurHTML = generateAttestationSurHonneurHTML({
+        nom: prospect.nom,
+        prenom: prospect.prenom,
+        adresse: prospect.adresse || "",
+        codePostal: prospect.codePostal || "",
+        ville: prospect.ville || "",
+        nomSociete: prospect.nomSociete || `${prospect.prenom} ${prospect.nom}`,
+        siret: prospect.siret || "",
+        codeVendeur: prospect.codeVendeur || ""
+      });
+      
+      // 1. Enregistrer l'attestation de formation
+      const [attestationFormation] = await db.insert(recruitmentDocuments)
+        .values({
+          type: DOCUMENT_TYPES.ATTESTATION_FORMATION,
+          nomFichier: `attestation_formation_${prospect.nom.toLowerCase()}_${prospect.prenom.toLowerCase()}.html`,
+          contenuDocument: attestationFormationHTML,
+          cheminFichier: `/documents/attestations/${prospectId}_attestation_formation.html`,
+          tailleFichier: Buffer.byteLength(attestationFormationHTML, 'utf8'),
+          prospectId: prospect.id,
+          uploadedById: req.user.id,
+          estSigne: false,
+          dateUpload: new Date()
+        })
+        .returning();
+      
+      // 2. Enregistrer l'attestation sur l'honneur
+      const [attestationSurHonneur] = await db.insert(recruitmentDocuments)
+        .values({
+          type: DOCUMENT_TYPES.ATTESTATION_SUR_HONNEUR,
+          nomFichier: `attestation_sur_honneur_${prospect.nom.toLowerCase()}_${prospect.prenom.toLowerCase()}.html`,
+          contenuDocument: attestationSurHonneurHTML,
+          cheminFichier: `/documents/attestations/${prospectId}_attestation_sur_honneur.html`,
+          tailleFichier: Buffer.byteLength(attestationSurHonneurHTML, 'utf8'),
+          prospectId: prospect.id,
+          uploadedById: req.user.id,
+          estSigne: false,
+          dateUpload: new Date()
+        })
+        .returning();
+      
+      // Ajouter une activité pour les attestations
+      await db.insert(recruitmentActivities)
+        .values({
+          type: "document",
+          titre: "Attestations générées",
+          description: "Attestation de formation et attestation sur l'honneur générées",
+          dateActivite: new Date(),
+          prospectId: prospect.id,
+          recruteurId: prospect.recruteurId
+        });
+      
+      res.status(201).json({
+        message: "Attestations générées avec succès",
+        attestationFormation,
+        attestationSurHonneur
+      });
+    } catch (error) {
+      console.error("Erreur lors de la génération de l'attestation:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+  
+  // Endpoint pour la signature électronique
+  app.post("/api/recruitment/documents/sign", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      const { documentId, signatureData } = req.body;
+      
+      if (!documentId) {
+        return res.status(400).json({ message: "ID de document requis" });
+      }
+      
+      if (!signatureData || !signatureData.signature) {
+        return res.status(400).json({ message: "Données de signature requises" });
+      }
+      
+      // Récupérer le document
+      const document = await db.query.recruitmentDocuments.findFirst({
+        where: eq(recruitmentDocuments.id, documentId)
+      });
+      
+      if (!document) {
+        return res.status(404).json({ message: "Document non trouvé" });
+      }
+      
+      if (document.estSigne) {
+        return res.status(400).json({ message: "Le document est déjà signé" });
+      }
+      
+      // Construire les métadonnées de signature sécurisées
+      const signatureMetadata = {
+        signature: signatureData.signature,
+        date: new Date().toISOString(),
+        ipAddress: req.ip || "unknown",
+        userAgent: req.headers["user-agent"] || "unknown",
+        userId: req.user.id,
+        timestamp: Date.now(),
+        // Créer un identifiant unique pour la signature
+        signatureId: crypto.randomUUID ? crypto.randomUUID() : `sig-${Date.now()}-${Math.random().toString(36).substring(2, 10)}`
+      };
+      
+      // Mettre à jour le document
+      const updatedDocument = await db.update(recruitmentDocuments)
+        .set({
+          estSigne: true,
+          signatureData: signatureMetadata,
+          dateSignature: new Date()
+        })
+        .where(eq(recruitmentDocuments.id, documentId))
+        .returning();
+      
+      // Si c'est une attestation de formation, rien d'autre à faire
+      // Si c'est un contrat, mettre à jour le statut du prospect
+      if (document.type === DOCUMENT_TYPES.CONTRAT_SIGNE) {
+        await db.update(recruitmentProspects)
+          .set({
+            contratSigne: true,
+            dateSignatureContrat: new Date(),
+            stade: "actif", // Mettre à jour le stade si nécessaire
+            updatedAt: new Date()
+          })
+          .where(eq(recruitmentProspects.id, document.prospectId));
+        
+        // Ajouter une activité pour la signature du contrat
+        await db.insert(recruitmentActivities)
+          .values({
+            type: "contrat",
+            titre: "Contrat signé",
+            description: "Le contrat a été signé électroniquement",
+            dateActivite: new Date(),
+            prospectId: document.prospectId,
+            recruteurId: req.user.id // À adapter selon votre modèle
+          });
+      }
+      
+      res.json({
+        message: "Document signé avec succès",
+        document: updatedDocument[0]
+      });
+    } catch (error) {
+      console.error("Erreur lors de la signature du document:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  // Route pour envoyer un document par email
+  app.post("/api/recruitment/documents/send-email", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      const { documentId, recipientEmail, recipientName } = req.body;
+      
+      if (!documentId || !recipientEmail) {
+        return res.status(400).json({ message: "ID de document et email du destinataire requis" });
+      }
+      
+      // Vérifier que l'email est valide
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailRegex.test(recipientEmail)) {
+        return res.status(400).json({ message: "Format d'email invalide" });
+      }
+      
+      // Récupérer le document
+      const document = await db.query.recruitmentDocuments.findFirst({
+        where: eq(recruitmentDocuments.id, documentId)
+      });
+      
+      if (!document) {
+        return res.status(404).json({ message: "Document non trouvé" });
+      }
+      
+      // Importer le service d'email
+      const { sendAttestationEmail } = await import('./email-service');
+      
+      // Envoyer l'email
+      const success = await sendAttestationEmail(document, recipientEmail, recipientName || "");
+      
+      if (success) {
+        // Ajouter une activité pour tracer l'envoi
+        await db.insert(recruitmentActivities)
+          .values({
+            type: "email",
+            titre: "Attestation envoyée par email",
+            description: `Attestation envoyée à ${recipientEmail}`,
+            dateActivite: new Date(),
+            prospectId: document.prospectId,
+            recruteurId: req.user.id
+          });
+        
+        return res.status(200).json({ 
+          message: "Document envoyé par email avec succès",
+          success: true
+        });
+      } else {
+        return res.status(500).json({ 
+          message: "Erreur lors de l'envoi du document par email", 
+          success: false 
+        });
+      }
+    } catch (error) {
+      console.error("Erreur lors de l'envoi du document par email:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  // Route pour accéder aux documents directement
+  // Endpoint d'administration pour vérifier et corriger les relations de données
+  app.post("/api/admin/fix-data-relations", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      const { validateAndFixDataRelations } = await import("./data-validation");
+      await validateAndFixDataRelations();
+      
+      res.json({ success: true, message: "Vérification et correction des données effectuées avec succès" });
+    } catch (error) {
+      console.error("Erreur lors de la correction des données:", error);
+      res.status(500).json({ message: "Erreur serveur lors de la correction des données" });
+    }
+  });
+  
+  app.get("/documents/:type/:id", async (req: Request, res: Response) => {
+    try {
+      const { type, id } = req.params;
+      
+      if (!type || !id) {
+        return res.status(400).json({ message: "Type et ID de document requis" });
+      }
+      
+      // Extraire l'ID du prospect et le type de document
+      const documentId = parseInt(id.split('_')[0]);
+      if (isNaN(documentId)) {
+        return res.status(400).json({ message: "ID de document invalide" });
+      }
+      
+      // Récupérer le document depuis la base de données
+      const document = await db.query.recruitmentDocuments.findFirst({
+        where: eq(recruitmentDocuments.id, documentId)
+      });
+      
+      if (!document) {
+        return res.status(404).json({ message: "Document non trouvé" });
+      }
+      
+      // Déterminer le type MIME
+      let contentType = 'application/octet-stream';
+      
+      if (type === 'attestations') {
+        contentType = 'text/html';
+      } else if (id.endsWith('.pdf')) {
+        contentType = 'application/pdf';
+      } else if (id.endsWith('.html')) {
+        contentType = 'text/html';
+      }
+      
+      // Si le document a un contenu stocké directement dans la base de données
+      if (document.contenuDocument) {
+        // Pour les attestations, convertir en PDF si demandé
+        if (type === 'attestations' && req.query.format === 'pdf') {
+          // Ici on renvoie simplement le HTML car la conversion sera faite côté client
+          // avec une bibliothèque comme jsPDF ou html2pdf
+          return res.setHeader('Content-Type', contentType)
+                    .setHeader('Content-Disposition', `attachment; filename="${document.nomFichier.replace('.html', '.pdf')}"`)
+                    .send(document.contenuDocument);
+        }
+        
+        // Renvoyer le contenu du document
+        return res.setHeader('Content-Type', contentType).send(document.contenuDocument);
+      }
+      
+      // Si le document est stocké comme fichier (non implémenté actuellement)
+      return res.status(404).json({ message: "Contenu du document non disponible" });
+    } catch (error) {
+      console.error("Erreur lors de l'accès au document:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  // Routes publiques pour le tunnel de recrutement (accessible sans authentification)
+  // Vérification du token pour accéder aux données d'un prospect
+  async function verifyProspectToken(prospectId: number, token: string) {
+    if (!prospectId || !token) {
+      return false;
+    }
+    
+    const prospect = await db.query.recruitmentProspects.findFirst({
+      where: eq(recruitmentProspects.id, prospectId)
+    });
+    
+    if (!prospect) {
+      return false;
+    }
+    
+    // Créer un token basé sur l'ID, l'email et un sel unique (date de création)
+    const dateStr = prospect.createdAt.toISOString().split('T')[0];
+    const expectedToken = crypto
+      .createHash('sha256')
+      .update(`${prospect.id}-${prospect.email}-${dateStr}`)
+      .digest('hex');
+    
+    return token === expectedToken;
+  }
+  
+  // Récupérer les données d'un prospect par son ID (avec vérification de token)
+  app.get("/api/recruitment/public/prospects/:id", async (req: Request, res: Response) => {
+    try {
+      const { id } = req.params;
+      const { token } = req.query;
+      const prospectId = parseInt(id);
+      
+      if (isNaN(prospectId)) {
+        return res.status(400).json({ message: "ID prospect invalide" });
+      }
+      
+      if (!token || typeof token !== 'string') {
+        return res.status(401).json({ message: "Token d'accès requis" });
+      }
+      
+      // Vérifier le token
+      const isValidToken = await verifyProspectToken(prospectId, token);
+      if (!isValidToken) {
+        return res.status(401).json({ message: "Token d'accès invalide" });
+      }
+      
+      // Récupérer les données du prospect
+      const prospect = await db.query.recruitmentProspects.findFirst({
+        where: eq(recruitmentProspects.id, prospectId)
+      });
+      
+      if (!prospect) {
+        return res.status(404).json({ message: "Prospect non trouvé" });
+      }
+      
+      res.json(prospect);
+    } catch (error) {
+      console.error("Erreur lors de la récupération des données du prospect:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+  
+  // Mettre à jour le statut de formation d'un prospect
+  app.put("/api/recruitment/public/prospects/:id/formation-status", async (req: Request, res: Response) => {
+    try {
+      const { id } = req.params;
+      const { token } = req.query;
+      const { formationCompletee } = req.body;
+      const prospectId = parseInt(id);
+      
+      if (isNaN(prospectId)) {
+        return res.status(400).json({ message: "ID prospect invalide" });
+      }
+      
+      if (!token || typeof token !== 'string') {
+        return res.status(401).json({ message: "Token d'accès requis" });
+      }
+      
+      // Vérifier le token
+      const isValidToken = await verifyProspectToken(prospectId, token);
+      if (!isValidToken) {
+        return res.status(401).json({ message: "Token d'accès invalide" });
+      }
+      
+      // Mettre à jour le statut de formation
+      const [updatedProspect] = await db.update(recruitmentProspects)
+        .set({
+          formationCompletee: formationCompletee,
+          dateFormation: new Date()
+        })
+        .where(eq(recruitmentProspects.id, prospectId))
+        .returning();
+      
+      res.json(updatedProspect);
+    } catch (error) {
+      console.error("Erreur lors de la mise à jour du statut de formation:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+  
+  // Soumettre le formulaire d'inscription
+  app.post("/api/recruitment/public/prospects/:id/submit-form", upload.fields([
+    { name: 'pieceIdentite', maxCount: 1 },
+    { name: 'rib', maxCount: 1 }
+  ]), async (req: Request, res: Response) => {
+    try {
+      const { id } = req.params;
+      const { token } = req.body;
+      const { adresse, codePostal, ville } = req.body;
+      const files = req.files as { [fieldname: string]: Express.Multer.File[] };
+      const prospectId = parseInt(id);
+      
+      if (isNaN(prospectId)) {
+        return res.status(400).json({ message: "ID prospect invalide" });
+      }
+      
+      if (!token || typeof token !== 'string') {
+        return res.status(401).json({ message: "Token d'accès requis" });
+      }
+      
+      // Vérifier le token
+      const isValidToken = await verifyProspectToken(prospectId, token);
+      if (!isValidToken) {
+        return res.status(401).json({ message: "Token d'accès invalide" });
+      }
+      
+      // Vérifier les données requises
+      if (!adresse || !codePostal || !ville) {
+        return res.status(400).json({ message: "Adresse, code postal et ville sont requis" });
+      }
+      
+      // Vérifier les fichiers
+      const pieceIdentite = files?.pieceIdentite?.[0];
+      const rib = files?.rib?.[0];
+      
+      if (!pieceIdentite || !rib) {
+        return res.status(400).json({ message: "Pièce d'identité et RIB sont requis" });
+      }
+      
+      // Mettre à jour les informations du prospect (ignorer adresse qui ne fait pas partie du schéma)
+      const [updatedProspect] = await db.update(recruitmentProspects)
+        .set({
+          codePostal,
+          ville,
+          pieceIdentiteDeposee: true,
+          ribDepose: true,
+          formulaireComplete: true,
+          // Pas de dateFormulaire dans le schéma
+        })
+        .where(eq(recruitmentProspects.id, prospectId))
+        .returning();
+      
+      // Stocker les fichiers (ici on simule le stockage)
+      // Dans une implémentation réelle, nous sauvegarderions les fichiers dans un système de stockage
+      
+      // Ajouter les documents dans la base de données
+      await db.insert(recruitmentDocuments).values([
+        {
+          prospectId,
+          type: 'piece_identite',
+          nomFichier: pieceIdentite.originalname,
+          cheminFichier: `/uploads/prospects/${prospectId}/piece_identite/${pieceIdentite.originalname}`,
+          tailleFichier: pieceIdentite.size,
+          dateUpload: new Date(),
+          uploadedById: 0, // 0 pour signifier que c'est le prospect lui-même
+          contenuDocument: null, // Le contenu n'est pas stocké en base
+          estSigne: null, // Pas besoin de signature pour ces documents
+          signatureData: null,
+          dateSignature: null
+        },
+        {
+          prospectId,
+          type: 'rib',
+          nomFichier: rib.originalname,
+          cheminFichier: `/uploads/prospects/${prospectId}/rib/${rib.originalname}`,
+          tailleFichier: rib.size,
+          dateUpload: new Date(),
+          uploadedById: 0,
+          contenuDocument: null,
+          estSigne: null,
+          signatureData: null,
+          dateSignature: null
+        }
+      ]);
+      
+      res.json(updatedProspect);
+    } catch (error) {
+      console.error("Erreur lors de la soumission du formulaire:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+  
+  // Générer un contrat pour un prospect
+  app.post("/api/recruitment/public/prospects/:id/generate-contract", async (req: Request, res: Response) => {
+    try {
+      const { id } = req.params;
+      const { token } = req.query;
+      const prospectId = parseInt(id);
+      
+      if (isNaN(prospectId)) {
+        return res.status(400).json({ message: "ID prospect invalide" });
+      }
+      
+      if (!token || typeof token !== 'string') {
+        return res.status(401).json({ message: "Token d'accès requis" });
+      }
+      
+      // Vérifier le token
+      const isValidToken = await verifyProspectToken(prospectId, token);
+      if (!isValidToken) {
+        return res.status(401).json({ message: "Token d'accès invalide" });
+      }
+      
+      // Récupérer les données du prospect
+      const prospect = await db.query.recruitmentProspects.findFirst({
+        where: eq(recruitmentProspects.id, prospectId)
+      });
+      
+      if (!prospect) {
+        return res.status(404).json({ message: "Prospect non trouvé" });
+      }
+      
+      // Vérifier que le formulaire a été complété
+      if (!prospect.formulaireComplete) {
+        return res.status(400).json({ message: "Le formulaire doit être complété avant de générer le contrat" });
+      }
+      
+      // Générer le contrat (ici on simule un contrat simple pour l'exemple)
+      const contenuContrat = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <title>Contrat de Vendeur</title>
+        <style>
+          body { font-family: Arial, sans-serif; margin: 40px; line-height: 1.5; }
+          .header { text-align: center; margin-bottom: 30px; }
+          h1 { color: #333; font-size: 24px; text-align: center; margin-bottom: 30px; }
+          .content { margin-bottom: 30px; }
+          .signature-section { margin-top: 60px; display: flex; justify-content: space-between; }
+          .signature-box { width: 45%; }
+          .signature-line { border-top: 1px solid #333; margin-top: 70px; margin-bottom: 10px; }
+          .footer { margin-top: 60px; font-size: 12px; text-align: center; color: #666; }
+        </style>
+      </head>
+      <body>
+        <div class="header">
+          <h1>CONTRAT DE VENDEUR INDÉPENDANT</h1>
+        </div>
+        
+        <div class="content">
+          <p>Entre les soussignés :</p>
+          <p><strong>Synergie Marketing Group</strong>, représentée par son directeur, ci-après dénommée "la Société"</p>
+          <p>Et</p>
+          <p><strong>${prospect.prenom} ${prospect.nom}</strong>, demeurant ${prospect.codePostal || ""} ${prospect.ville || ""}, ci-après dénommé "le Vendeur Indépendant"</p>
+          
+          <h2>Article 1 - Objet du contrat</h2>
+          <p>Le présent contrat a pour objet de définir les conditions dans lesquelles le Vendeur Indépendant s'engage à commercialiser les produits et services proposés par la Société.</p>
+          
+          <h2>Article 2 - Statut du Vendeur Indépendant</h2>
+          <p>Le Vendeur Indépendant exerce son activité en toute indépendance. Il n'est lié à la Société par aucun lien de subordination.</p>
+          
+          <h2>Article 3 - Obligations du Vendeur Indépendant</h2>
+          <p>Le Vendeur Indépendant s'engage à :</p>
+          <ul>
+            <li>Respecter la réglementation en vigueur</li>
+            <li>Suivre les formations obligatoires</li>
+            <li>Présenter de manière loyale et transparente les produits et services</li>
+            <li>Ne pas faire de promesses non autorisées par la Société</li>
+          </ul>
+          
+          <h2>Article 4 - Rémunération</h2>
+          <p>Le Vendeur Indépendant percevra des commissions selon le barème en vigueur au moment de la vente.</p>
+          
+          <h2>Article 5 - Durée</h2>
+          <p>Le présent contrat est conclu pour une durée indéterminée à compter de sa signature.</p>
+        </div>
+        
+        <div class="signature-section">
+          <div class="signature-box">
+            <p>Pour la Société :</p>
+            <div class="signature-line"></div>
+            <p>Date : ${new Date().toLocaleDateString('fr-FR')}</p>
+          </div>
+          
+          <div class="signature-box">
+            <p>Le Vendeur Indépendant :</p>
+            <div class="signature-line"></div>
+            <p>Date : </p>
+          </div>
+        </div>
+        
+        <div class="footer">
+          <p>Synergie Marketing Group - Contrat de Vendeur Indépendant - ${new Date().getFullYear()}</p>
+        </div>
+      </body>
+      </html>
+      `;
+      
+      // Enregistrer le contrat dans la base de données
+      const [document] = await db.insert(recruitmentDocuments).values({
+        prospectId,
+        type: 'contrat_vierge',
+        nomFichier: `contrat_vendeur_${prospect.prenom.toLowerCase()}_${prospect.nom.toLowerCase()}.html`,
+        cheminFichier: `/uploads/prospects/${prospectId}/contrat/contrat_vendeur.html`,
+        tailleFichier: contenuContrat.length,
+        dateUpload: new Date(),
+        uploadedById: 0,
+        contenuDocument: contenuContrat,
+        estSigne: false,
+        signatureData: null,
+        dateSignature: null
+      }).returning();
+      
+      // Mettre à jour le statut du prospect
+      await db.update(recruitmentProspects)
+        .set({
+          contratGenere: true,
+          // Pas de dateContratGenere dans le schéma
+        })
+        .where(eq(recruitmentProspects.id, prospectId));
+      
+      res.json({ 
+        success: true, 
+        message: "Contrat généré avec succès", 
+        document 
+      });
+    } catch (error) {
+      console.error("Erreur lors de la génération du contrat:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+  
+  // Générer une attestation de formation pour un prospect
+  app.post("/api/recruitment/public/prospects/:id/generate-attestation", async (req: Request, res: Response) => {
+    try {
+      const { id } = req.params;
+      const { token } = req.query;
+      const prospectId = parseInt(id);
+      
+      if (isNaN(prospectId)) {
+        return res.status(400).json({ message: "ID prospect invalide" });
+      }
+      
+      if (!token || typeof token !== 'string') {
+        return res.status(401).json({ message: "Token d'accès requis" });
+      }
+      
+      // Vérifier le token
+      const isValidToken = await verifyProspectToken(prospectId, token);
+      if (!isValidToken) {
+        return res.status(401).json({ message: "Token d'accès invalide" });
+      }
+      
+      // Récupérer les données du prospect
+      const prospect = await db.query.recruitmentProspects.findFirst({
+        where: eq(recruitmentProspects.id, prospectId)
+      });
+      
+      if (!prospect) {
+        return res.status(404).json({ message: "Prospect non trouvé" });
+      }
+      
+      // Vérifier si la formation a été complétée
+      if (!prospect.formationCompletee) {
+        return res.status(400).json({ 
+          message: "Le prospect n'a pas encore complété sa formation" 
+        });
+      }
+      
+      // Générer le contenu HTML de l'attestation
+      const dateFormation = prospect.dateFormation 
+        ? new Date(prospect.dateFormation).toLocaleDateString('fr-FR') 
+        : new Date().toLocaleDateString('fr-FR');
+      
+      const dateAttestation = new Date().toLocaleDateString('fr-FR');
+      
+      // Importer les fonctions de génération de documents
+      const { generateAttestationHTML, generateAttestationSurHonneurHTML } = await import("../client/src/lib/document-templates");
+      
+      // Générer l'attestation de formation
+      const attestationFormationHTML = generateAttestationHTML(
+        prospect.nom,
+        prospect.prenom,
+        dateFormation,
+        dateAttestation
+      );
+      
+      // Générer aussi l'attestation sur l'honneur
+      const attestationSurHonneurHTML = generateAttestationSurHonneurHTML({
+        nom: prospect.nom,
+        prenom: prospect.prenom,
+        adresse: prospect.adresse || "",
+        codePostal: prospect.codePostal || "",
+        ville: prospect.ville || "",
+        nomSociete: prospect.nomSociete || `${prospect.prenom} ${prospect.nom}`,
+        siret: prospect.siret || "",
+        codeVendeur: prospect.codeVendeur || ""
+      });
+      
+      // Trouver un administrateur pour l'attribution du document
+      const adminUser = await db.query.users.findFirst({
+        where: eq(users.role, "admin")
+      });
+      
+      if (!adminUser) {
+        return res.status(500).json({ message: "Erreur: aucun administrateur trouvé dans le système" });
+      }
+      
+      // 1. Enregistrer l'attestation de formation
+      const [attestationFormation] = await db.insert(recruitmentDocuments)
+        .values({
+          type: DOCUMENT_TYPES.ATTESTATION_FORMATION,
+          nomFichier: `attestation_formation_${prospect.nom.toLowerCase()}_${prospect.prenom.toLowerCase()}.html`,
+          contenuDocument: attestationFormationHTML,
+          cheminFichier: `/documents/attestations/${prospectId}_attestation_formation.html`,
+          tailleFichier: Buffer.byteLength(attestationFormationHTML, 'utf8'),
+          prospectId: prospect.id,
+          uploadedById: adminUser.id,
+          estSigne: false,
+          dateUpload: new Date()
+        })
+        .returning();
+      
+      // 2. Enregistrer l'attestation sur l'honneur
+      const [attestationSurHonneur] = await db.insert(recruitmentDocuments)
+        .values({
+          type: DOCUMENT_TYPES.ATTESTATION_SUR_HONNEUR,
+          nomFichier: `attestation_sur_honneur_${prospect.nom.toLowerCase()}_${prospect.prenom.toLowerCase()}.html`,
+          contenuDocument: attestationSurHonneurHTML,
+          cheminFichier: `/documents/attestations/${prospectId}_attestation_sur_honneur.html`,
+          tailleFichier: Buffer.byteLength(attestationSurHonneurHTML, 'utf8'),
+          prospectId: prospect.id,
+          uploadedById: adminUser.id,
+          estSigne: false,
+          dateUpload: new Date()
+        })
+        .returning();
+      
+      // Ajouter une activité pour les attestations
+      await db.insert(recruitmentActivities)
+        .values({
+          type: "document",
+          titre: "Attestations générées",
+          description: "Attestation de formation et attestation sur l'honneur générées",
+          dateActivite: new Date(),
+          prospectId: prospect.id,
+          recruteurId: prospect.recruteurId || null
+        });
+      
+      res.json({ 
+        success: true, 
+        message: "Attestations générées avec succès", 
+        attestationFormation,
+        attestationSurHonneur
+      });
+    } catch (error) {
+      console.error("Erreur lors de la génération des attestations:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+  
+  // Soumettre un contrat signé
+  app.post("/api/recruitment/public/prospects/:id/submit-contract", upload.single('contratSigne'), async (req: Request, res: Response) => {
+    try {
+      const { id } = req.params;
+      const { token } = req.body;
+      const file = req.file;
+      const prospectId = parseInt(id);
+      
+      if (isNaN(prospectId)) {
+        return res.status(400).json({ message: "ID prospect invalide" });
+      }
+      
+      if (!token || typeof token !== 'string') {
+        return res.status(401).json({ message: "Token d'accès requis" });
+      }
+      
+      // Vérifier le token
+      const isValidToken = await verifyProspectToken(prospectId, token);
+      if (!isValidToken) {
+        return res.status(401).json({ message: "Token d'accès invalide" });
+      }
+      
+      if (!file) {
+        return res.status(400).json({ message: "Contrat signé requis" });
+      }
+      
+      // Récupérer les données du prospect
+      const prospect = await db.query.recruitmentProspects.findFirst({
+        where: eq(recruitmentProspects.id, prospectId)
+      });
+      
+      if (!prospect) {
+        return res.status(404).json({ message: "Prospect non trouvé" });
+      }
+      
+      // Enregistrer le contrat signé dans la base de données
+      const [document] = await db.insert(recruitmentDocuments).values({
+        prospectId,
+        type: 'contrat_signe',
+        nomFichier: file.originalname,
+        cheminFichier: `/uploads/prospects/${prospectId}/contrat/contrat_signe.pdf`,
+        tailleFichier: file.size,
+        dateUpload: new Date(),
+        uploadedById: 0,
+        contenuDocument: null, // Le fichier PDF n'est pas stocké comme contenu
+        estSigne: true,
+        signatureData: null, // La signature est dans le fichier lui-même
+        dateSignature: new Date()
+      }).returning();
+      
+      // Mettre à jour le statut du prospect
+      await db.update(recruitmentProspects)
+        .set({
+          contratSigne: true,
+          dateContratSigne: new Date(),
+          statut: "Vendeur"
+        })
+        .where(eq(recruitmentProspects.id, prospectId));
+      
+      res.json({ 
+        success: true, 
+        message: "Contrat signé soumis avec succès", 
+        document 
+      });
+    } catch (error) {
+      console.error("Erreur lors de la soumission du contrat signé:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+  
+  // Récupérer les documents d'un prospect (version publique)
+  app.get("/api/recruitment/public/prospects/:id/documents", async (req: Request, res: Response) => {
+    try {
+      const { id } = req.params;
+      const { token, type } = req.query;
+      const prospectId = parseInt(id);
+      
+      if (isNaN(prospectId)) {
+        return res.status(400).json({ message: "ID prospect invalide" });
+      }
+      
+      if (!token || typeof token !== 'string') {
+        return res.status(401).json({ message: "Token d'accès requis" });
+      }
+      
+      // Vérifier le token
+      const isValidToken = await verifyProspectToken(prospectId, token);
+      if (!isValidToken) {
+        return res.status(401).json({ message: "Token d'accès invalide" });
+      }
+      
+      // Construire la requête de base
+      let query = db.select().from(recruitmentDocuments)
+        .where(eq(recruitmentDocuments.prospectId, prospectId));
+      
+      // Filtrer par type si spécifié
+      if (type && typeof type === 'string') {
+        query = query.where(eq(recruitmentDocuments.type, type as DocumentType));
+      }
+      
+      // Exécuter la requête
+      const documents = await query.orderBy(desc(recruitmentDocuments.createdAt));
+      
+      res.json(documents);
+    } catch (error) {
+      console.error("Erreur lors de la récupération des documents:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+  
+  // Signer un document électroniquement (version publique)
+  app.post("/api/recruitment/public/documents/sign", async (req: Request, res: Response) => {
+    try {
+      const { documentId, signatureData } = req.body;
+      
+      if (!documentId || !signatureData?.signature) {
+        return res.status(400).json({ message: "ID de document et signature requis" });
+      }
+      
+      // Récupérer le document
+      const document = await db.query.recruitmentDocuments.findFirst({
+        where: eq(recruitmentDocuments.id, documentId)
+      });
+      
+      if (!document) {
+        return res.status(404).json({ message: "Document non trouvé" });
+      }
+      
+      // Vérifier qu'il n'est pas déjà signé
+      if (document.estSigne) {
+        return res.status(400).json({ message: "Ce document est déjà signé" });
+      }
+      
+      // Mettre à jour le document avec la signature
+      const [updatedDocument] = await db.update(recruitmentDocuments)
+        .set({
+          estSigne: true,
+          signatureData: signatureData,
+          dateSignature: new Date()
+        })
+        .where(eq(recruitmentDocuments.id, documentId))
+        .returning();
+      
+      // Si c'est une attestation de formation, mettre à jour le statut
+      if (document.type === 'attestation_formation') {
+        await db.update(recruitmentProspects)
+          .set({
+            attestationSignee: true,
+            dateAttestationSignee: new Date()
+          })
+          .where(eq(recruitmentProspects.id, document.prospectId));
+      }
+      
+      res.json({ 
+        success: true, 
+        message: "Document signé avec succès", 
+        document: updatedDocument 
+      });
+    } catch (error) {
+      console.error("Erreur lors de la signature du document:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+  
+  // Envoyer un document par email (version publique)
+  app.post("/api/recruitment/public/documents/email", async (req: Request, res: Response) => {
+    try {
+      const { documentId, recipientEmail, recipientName } = req.body;
+      
+      if (!documentId || !recipientEmail) {
+        return res.status(400).json({ message: "ID de document et email du destinataire requis" });
+      }
+      
+      // Récupérer le document
+      const document = await db.query.recruitmentDocuments.findFirst({
+        where: eq(recruitmentDocuments.id, documentId)
+      });
+      
+      if (!document) {
+        return res.status(404).json({ message: "Document non trouvé" });
+      }
+      
+      // Récupérer le prospect associé
+      const prospect = await db.query.recruitmentProspects.findFirst({
+        where: eq(recruitmentProspects.id, document.prospectId)
+      });
+      
+      if (!prospect) {
+        return res.status(404).json({ message: "Prospect associé non trouvé" });
+      }
+      
+      // Envoyer l'email avec le document
+      // Utiliser le service d'email pour envoyer le document (ex: sendAttestationEmail)
+      const emailService = await import('./email-service');
+      const emailSent = await emailService.sendAttestationEmail(
+        document,
+        recipientEmail,
+        recipientName || `${prospect.prenom} ${prospect.nom}`
+      );
+      
+      if (!emailSent) {
+        return res.status(500).json({ message: "Erreur lors de l'envoi de l'email" });
+      }
+      
+      res.json({ 
+        success: true, 
+        message: "Document envoyé par email avec succès" 
+      });
+    } catch (error) {
+      console.error("Erreur lors de l'envoi du document par email:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  // API Routes pour les paramètres de l'application
+  app.get("/api/settings", async (req: Request, res: Response) => {
+    try {
+      // Récupérer tous les paramètres de l'application
+      const settings = await db.select().from(appSettings);
+      
+      // Transformer la liste en objet pour faciliter l'accès côté client
+      const settingsObject: Record<string, any> = {};
+      settings.forEach(setting => {
+        settingsObject[setting.key] = setting.value;
+      });
+      
+      // Ajouter l'URL du logo s'il existe
+      if (settingsObject["logo"]) {
+        settingsObject.logoUrl = `/uploads/${settingsObject["logo"]}`;
+      }
+      
+      return res.json(settingsObject);
+    } catch (error) {
+      console.error("Erreur lors de la récupération des paramètres de l'application:", error);
+      return res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+  
+  // Route pour mettre à jour un paramètre
+  app.post("/api/settings/:key", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      const { key } = req.params;
+      const { value, description } = req.body;
+      
+      // Vérifier si le paramètre existe déjà
+      const existingSetting = await db
+        .select()
+        .from(appSettings)
+        .where(eq(appSettings.key, key))
+        .limit(1)
+        .then(rows => rows[0]);
+      
+      if (existingSetting) {
+        // Mettre à jour le paramètre existant
+        const [updatedSetting] = await db
+          .update(appSettings)
+          .set({ 
+            value, 
+            description,
+            updatedAt: new Date() 
+          })
+          .where(eq(appSettings.key, key))
+          .returning();
+        
+        return res.json(updatedSetting);
+      } else {
+        // Créer un nouveau paramètre
+        const [newSetting] = await db
+          .insert(appSettings)
+          .values({
+            key,
+            value,
+            description,
+            updatedAt: new Date()
+          })
+          .returning();
+        
+        return res.status(201).json(newSetting);
+      }
+    } catch (error) {
+      console.error("Erreur lors de la mise à jour du paramètre:", error);
+      return res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+  
+  // Route pour télécharger un logo
+  app.post("/api/settings/upload/logo", (req: Request, res: Response, next: NextFunction) => {
+    console.log("Requête de téléchargement de logo reçue");
+    
+    // Utiliser un middleware intermédiaire pour capturer les erreurs multer
+    upload.single('logo')(req, res, (err) => {
+      if (err) {
+        console.error("Erreur Multer lors de l'upload:", err);
+        if (err.code === 'LIMIT_FILE_SIZE') {
+          return res.status(400).json({ message: "Fichier trop volumineux (max 5MB)" });
+        } else if (err instanceof multer.MulterError) {
+          return res.status(400).json({ message: `Erreur d'upload: ${err.message}` });
+        } else {
+          return res.status(400).json({ message: err.message || "Erreur lors du téléchargement" });
+        }
+      }
+      
+      // Continuer le processus après réussite de l'upload
+      handleLogoUpload(req, res);
+    });
+  });
+  
+  // Fonction séparée pour gérer le fichier une fois uploadé
+  async function handleLogoUpload(req: Request, res: Response) {
+    try {
+      if (!req.isAuthenticated()) {
+        return res.status(401).json({ message: "Non authentifié" });
+      }
+      
+      if (!req.file) {
+        return res.status(400).json({ message: "Aucun fichier n'a été téléchargé" });
+      }
+      
+      console.log("Fichier reçu:", req.file);
+      
+      // Le nom du fichier téléchargé
+      const filename = req.file.filename;
+      
+      // Mettre à jour le paramètre de logo
+      const existingSetting = await db
+        .select()
+        .from(appSettings)
+        .where(eq(appSettings.key, "logo"))
+        .limit(1)
+        .then(rows => rows[0]);
+      
+      if (existingSetting) {
+        // Si un logo existait déjà, supprimer l'ancien fichier
+        if (existingSetting.value) {
+          const oldLogoPath = path.join(__dirname, '../uploads', existingSetting.value);
+          console.log(`Vérification de l'ancien logo à: ${oldLogoPath}`);
+          if (fs.existsSync(oldLogoPath)) {
+            fs.unlinkSync(oldLogoPath);
+            console.log("Ancien logo supprimé");
+          }
+        }
+        
+        console.log("Mise à jour du paramètre de logo existant");
+        // Mettre à jour le paramètre existant
+        const [updatedSetting] = await db
+          .update(appSettings)
+          .set({ 
+            value: filename,
+            updatedAt: new Date() 
+          })
+          .where(eq(appSettings.key, "logo"))
+          .returning();
+        
+        return res.json({ 
+          ...updatedSetting,
+          logoUrl: `/uploads/${filename}`
+        });
+      } else {
+        console.log("Création d'un nouveau paramètre de logo");
+        // Créer un nouveau paramètre
+        const [newSetting] = await db
+          .insert(appSettings)
+          .values({
+            key: "logo",
+            value: filename,
+            description: "Logo de l'entreprise",
+            updatedAt: new Date()
+          })
+          .returning();
+        
+        return res.status(201).json({ 
+          ...newSetting,
+          logoUrl: `/uploads/${filename}`
+        });
+      }
+    } catch (error) {
+      console.error("Erreur lors du traitement du logo:", error);
+      return res.status(500).json({ message: "Erreur serveur" });
+    }
+  }
+  
+  // Route pour servir les fichiers téléchargés
+  app.use('/uploads', (req, res, next) => {
+    // Sécurité: éviter le "directory traversal"
+    const fileName = req.path.replace(/\.\./g, '').replace(/^\/+/, '');
+    const filePath = path.join(__dirname, '../uploads', fileName);
+    
+    // Vérifier si le fichier existe
+    if (fs.existsSync(filePath)) {
+      res.sendFile(filePath);
+    } else {
+      next();
+    }
+  });
+
+  // Create and return the HTTP server
+  // API pour obtenir les statistiques des codes vendeur
+  app.get("/api/vendor-codes", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      // Récupérer tous les codes vendeur distincts avec le nombre de clients associés
+      const vendorCodesWithCount = await db.execute(sql`
+        SELECT 
+          code_vendeur, 
+          COUNT(*) as client_count 
+        FROM clients 
+        WHERE code_vendeur IS NOT NULL 
+        GROUP BY code_vendeur 
+        ORDER BY client_count DESC
+      `);
+      
+      // Convertir le résultat en format JSON standard
+      const result = (vendorCodesWithCount as any).rows.map((row: any) => ({
+        codeVendeur: row.code_vendeur,
+        clientCount: parseInt(row.client_count)
+      }));
+      
+      res.json(result);
+    } catch (error) {
+      console.error("Erreur lors de la récupération des codes vendeur:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+  
+  // API pour obtenir les statistiques des codes vendeur
+  app.get("/api/vendor-codes", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      // Récupérer tous les codes vendeur distincts avec le nombre de clients associés
+      const vendorCodesWithCount = await db.execute(sql`
+        SELECT 
+          code_vendeur, 
+          COUNT(*) as client_count 
+        FROM clients 
+        WHERE code_vendeur IS NOT NULL 
+        GROUP BY code_vendeur 
+        ORDER BY client_count DESC
+      `);
+      
+      // Convertir le résultat en format JSON standard
+      const result = (vendorCodesWithCount as any).rows.map((row: any) => ({
+        codeVendeur: row.code_vendeur,
+        clientCount: parseInt(row.client_count)
+      }));
+      
+      res.json(result);
+    } catch (error) {
+      console.error("Erreur lors de la récupération des codes vendeur:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  // API pour obtenir le top 10 des vendeurs avec leurs performances
+  app.get("/api/top-vendors", async (req: Request, res: Response) => {
+    try {
+      if (!req.isAuthenticated()) return res.status(401).json({ message: "Non authentifié" });
+      
+      // Vérifier si l'utilisateur est un administrateur
+      const isAdmin = [1, 15].includes(req.user.id);
+      
+      // Récupérer les vendeurs que l'utilisateur connecté peut voir
+      let visibleVendorIds: number[] = [];
+      
+      if (isAdmin) {
+        // Les administrateurs peuvent voir tous les vendeurs
+        const allVendors = await db.select({ id: users.id }).from(users);
+        visibleVendorIds = allVendors.map(vendor => vendor.id);
+      } else {
+        // Pour les vendeurs normaux, nous allons simplement montrer quelques vendeurs 
+        // (puisque la structure de recrutement n'est pas complètement implémentée)
+        
+        // Ajouter l'ID de l'utilisateur connecté
+        visibleVendorIds.push(req.user.id);
+        
+        // Récupérer d'autres ID d'utilisateurs pour les exemples
+        const otherUsersResult = await db.execute(sql`
+          SELECT id FROM users WHERE id <> ${req.user.id} LIMIT 10
+        `);
+        
+        const otherUserIds = (otherUsersResult as any).rows
+          .map((row: any) => parseInt(row.id))
+          .filter((id: number) => !isNaN(id));
+          
+        visibleVendorIds = [...visibleVendorIds, ...otherUserIds];
+      }
+      
+      // Générer des données d'exemple pour le top 10 des vendeurs
+      const sampleData = [
+        { 
+          codeVendeur: "FR00123456",
+          userId: visibleVendorIds[0] || 16,
+          username: "exemple@synergie.fr",
+          prenom: "Thomas",
+          nom: "Dubois",
+          clientCount: 42,
+          partnersCount: 7 
+        },
+        { 
+          codeVendeur: "FR00123457",
+          userId: visibleVendorIds[1] || 2,
+          username: "sophie.martin@synergie.fr",
+          prenom: "Sophie",
+          nom: "Martin",
+          clientCount: 38,
+          partnersCount: 5 
+        },
+        { 
+          codeVendeur: "FR00123458",
+          userId: visibleVendorIds[2] || 3,
+          username: "lucas.bernard@synergie.fr",
+          prenom: "Lucas",
+          nom: "Bernard",
+          clientCount: 32,
+          partnersCount: 4 
+        },
+        { 
+          codeVendeur: "FR00123459",
+          userId: visibleVendorIds[3] || 4,
+          username: "julie.petit@synergie.fr",
+          prenom: "Julie",
+          nom: "Petit",
+          clientCount: 29,
+          partnersCount: 3 
+        },
+        { 
+          codeVendeur: "FR00123460",
+          userId: visibleVendorIds[4] || 5,
+          username: "nicolas.robert@synergie.fr",
+          prenom: "Nicolas",
+          nom: "Robert",
+          clientCount: 26,
+          partnersCount: 2 
+        },
+        { 
+          codeVendeur: "FR00123461",
+          userId: visibleVendorIds[5] || 6,
+          username: "laura.richard@synergie.fr",
+          prenom: "Laura",
+          nom: "Richard",
+          clientCount: 24,
+          partnersCount: 2 
+        },
+        { 
+          codeVendeur: "FR00123462",
+          userId: visibleVendorIds[6] || 7,
+          username: "maxime.durand@synergie.fr",
+          prenom: "Maxime",
+          nom: "Durand",
+          clientCount: 22,
+          partnersCount: 1 
+        },
+        { 
+          codeVendeur: "FR00123463",
+          userId: visibleVendorIds[7] || 8,
+          username: "emilie.moreau@synergie.fr",
+          prenom: "Emilie",
+          nom: "Moreau",
+          clientCount: 20,
+          partnersCount: 1 
+        },
+        { 
+          codeVendeur: "FR00123464",
+          userId: visibleVendorIds[8] || 9,
+          username: "alexandre.simon@synergie.fr",
+          prenom: "Alexandre",
+          nom: "Simon",
+          clientCount: 18,
+          partnersCount: 0 
+        },
+        { 
+          codeVendeur: "FR00123465",
+          userId: visibleVendorIds[9] || 10,
+          username: "celine.laurent@synergie.fr",
+          prenom: "Céline",
+          nom: "Laurent",
+          clientCount: 15,
+          partnersCount: 0 
+        }
+      ];
+      
+      res.json(sampleData);
+    } catch (error) {
+      console.error("Erreur lors de la récupération des vendeurs:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  const httpServer = createServer(app);
+  return httpServer;
+}

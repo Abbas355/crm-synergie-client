@@ -1,0 +1,75 @@
+                  {/* Statut du client */}
+                  <FormField
+                    control={form.control}
+                    name="status"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel className="text-gray-700 font-medium">Statut du client <span className="text-red-500">*</span></FormLabel>
+                        {isProduction ? (
+                          <FormControl>
+                            <SimpleSelect
+                              options={clientStatusOptions}
+                              value={field.value || ""}
+                              onChange={(value) => {
+                                field.onChange(value);
+                                // Ouvrir automatiquement le calendrier si nécessaire
+                                if (value === 'rendez-vous') {
+                                  setTimeout(() => setDateRendezVousOpen(true), 100);
+                                } else if (value === 'installation') {
+                                  setTimeout(() => setDateInstallationOpen(true), 100);
+                                }
+                              }}
+                              placeholder="Sélectionner un statut"
+                              disabled={client && !editMode}
+                            />
+                          </FormControl>
+                        ) : (
+                          <Select
+                            onValueChange={(value) => {
+                              field.onChange(value);
+                              // Ouvrir automatiquement le calendrier si nécessaire
+                              if (value === 'rendez-vous') {
+                                setTimeout(() => setDateRendezVousOpen(true), 100);
+                              } else if (value === 'installation') {
+                                setTimeout(() => setDateInstallationOpen(true), 100);
+                              }
+                            }}
+                            value={field.value || ""}
+                            defaultValue={field.value || ""}
+                            disabled={client && !editMode}
+                          >
+                            <FormControl>
+                              <SelectTrigger className="bg-white border-gray-200 h-10">
+                                <SelectValue placeholder="Sélectionner un statut" />
+                              </SelectTrigger>
+                            </FormControl>
+                            <SelectContent>
+                              {clientStatusOptions.map((option) => (
+                                <SelectItem key={option.value} value={option.value}>
+                                  {option.label}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        )}
+                        <FormDescription className="text-xs">
+                          Le statut détermine l'étape dans le parcours client
+                        </FormDescription>
+                        {field.value === 'installation' && form.getValues('dateInstallation') && (
+                          <div className="mt-1 text-sm text-green-700 font-medium flex items-center">
+                            <span className="inline-block h-2 w-2 rounded-full bg-green-500 mr-2"></span>
+                            Date d'installation: {(() => {
+                              try {
+                                const dateValue = form.getValues('dateInstallation');
+                                return dateValue ? format(new Date(dateValue), 'dd/MM/yyyy', { locale: fr }) : '';
+                              } catch (e) {
+                                console.error("Erreur formatage date:", e);
+                                return '';
+                              }
+                            })()}
+                          </div>
+                        )}
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />

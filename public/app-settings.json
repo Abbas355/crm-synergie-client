@@ -1,0 +1,39 @@
+{
+  "general_settings": {
+    "company": {
+      "name": "Synergie Marketing Group ",
+      "address": "2, Place Alexandre Farnèse ",
+      "city": "Avignon ",
+      "postalCode": "84000",
+      "country": "France",
+      "phone": "01 23 45 67 89",
+      "email": "contact@synergiemarketingroup.fr",
+      "siret": "12345678901234",
+      "website": "www.synergiemarketingroup.fr",
+      "ibanDebiteur": "FR76 3000 4000 0100 0012 3400",
+      "ibanCrediteur": ""
+    },
+    "user": {
+      "language": "fr",
+      "timezone": "Europe/Paris",
+      "dateFormat": "dd/MM/yyyy",
+      "theme": "system"
+    },
+    "notifications": {
+      "emailNotifications": true,
+      "pushNotifications": true,
+      "smsNotifications": false,
+      "newClientNotifications": true,
+      "taskReminders": true,
+      "commissionAlerts": true,
+      "systemUpdates": false
+    },
+    "updatedAt": "2025-07-09T01:46:02.284Z"
+  },
+  "company_logo": {
+    "value": "/uploads/logo-1752039175360-42602137.jpg",
+    "type": "file",
+    "description": "Logo de l'entreprise",
+    "updatedAt": "2025-07-09T05:32:55.667Z"
+  }
+}

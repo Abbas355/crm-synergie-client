@@ -1,0 +1,1893 @@
+import { useState, useEffect, useRef, useMemo } from "react";
+import { z } from "zod";
+import { ProductionSafeSelect } from "@/lib/production-safe-select";
+import { MobileSafeDatePicker } from "@/components/mobile-safe-date-picker";
+import { useRole } from "@/hooks/use-role";
+// Détecte si nous sommes en mode production
+const isProduction = import.meta.env.MODE === 'production';
+
+// Composant de menu déroulant simplifié pour la production
+function SimpleSelect({ 
+  options, 
+  value, 
+  onChange, 
+  placeholder, 
+  disabled 
+}: { 
+  options: { value: string; label: string }[]; 
+  value: string; 
+  onChange: (value: string) => void; 
+  placeholder: string; 
+  disabled?: boolean 
+}) {
+  // En production, nous devons spécifiquement gérer les événements pour mobile
+  const handleChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+    try {
+      const newValue = e.target.value;
+      console.log("SimpleSelect onChange appelé avec la valeur:", newValue);
+      
+      // On utilise un délai court pour éviter les problèmes de rendu sur mobile
+      // Sur Android, cela donne le temps au navigateur de finir le rendu visuel
+      if (newValue) {
+        setTimeout(() => {
+          onChange(newValue);
+          
+          // Force un blur pour fermer le sélecteur sur certains appareils mobiles
+          e.target.blur();
+        }, 50);
+      }
+    } catch (err) {
+      console.error("Erreur lors du changement de valeur dans SimpleSelect:", err);
+      // Si une erreur se produit, on essaie quand même de mettre à jour la valeur
+      try {
+        onChange(e.target.value);
+      } catch (innerErr) {
+        console.error("Echec de la tentative de récupération après erreur:", innerErr);
+      }
+    }
+  };
+
+  return (
+    <select
+      className="w-full h-10 px-3 py-2 bg-white border border-gray-200 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+      value={value}
+      onChange={handleChange}
+      disabled={disabled}
+      aria-label={placeholder}
+      role="combobox"
+      style={{ WebkitAppearance: 'menulist', appearance: 'menulist' }}
+    >
+      <option value="" disabled>
+        {placeholder}
+      </option>
+      {options.map(option => (
+        <option key={option.value} value={option.value} role="option">
+          {option.label}
+        </option>
+      ))}
+    </select>
+  );
+}
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import { apiRequest, queryClient } from "@/lib/queryClient";
+import { Client } from "@shared/schema";
+import { useToast } from "@/hooks/use-toast";
+import { getCommunesByCodePostal } from "@/lib/api-communes";
+import { CommuneInput } from "@/components/ui/commune-input";
+import { StatusBadge } from "@/components/ui/status-badge";
+import { ClientFormContratTab } from "./client-form-contrat-tab-mobile";
+import { ClientFormInfosTab } from "./client-form-infos-tab-mobile";
+import { SaferSelect } from "@/components/safer-select";
+
+import {
+  Dialog,
+  DialogContent,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Button } from "@/components/ui/button";
+import {
+  Form,
+  FormControl,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+  FormDescription,
+} from "@/components/ui/form";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
+} from "@/components/ui/tabs";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
+import { 
+  User,
+  Mail, 
+  Phone, 
+  Calendar,
+  ChevronLeft,
+  X,
+  Loader2,
+  MapPin,
+  FileText,
+  Info,
+  Tag,
+  Search,
+  ListChecks,
+  Pencil,
+  Trash2,
+  AlertTriangle
+} from "lucide-react";
+import { format } from "date-fns";
+import { fr } from "date-fns/locale";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Calendar as CalendarComponent } from "@/components/ui/calendar";
+import { useAuth } from "@/hooks/use-auth";
+
+type ClientFormProps = {
+  isOpen: boolean;
+  onClose: () => void;
+  client?: Client; // Optional for edit mode
+};
+
+const clientFormSchema = z.object({
+  civilite: z.string().min(1, "La civilité est requise"),
+  prenom: z.string().min(1, "Le prénom est requis"),
+  nom: z.string().min(1, "Le nom est requis"),
+  email: z.string().email("Email invalide"),
+  mobile: z.string().min(8, "Numéro de mobile invalide"),
+  fixe: z.string().optional(),
+  dateNaissance: z.string()
+    .regex(/^\d{2}\/\d{2}\/\d{4}$/, "Format de date invalide (jj/mm/aaaa)")
+    .refine((date) => {
+      const [day, month, year] = date.split('/').map(Number);
+      const dateOfBirth = new Date(year, month - 1, day);
+      const today = new Date();
+      let age = today.getFullYear() - dateOfBirth.getFullYear();
+      const monthDiff = today.getMonth() - dateOfBirth.getMonth();
+      if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < dateOfBirth.getDate())) {
+        age--;
+      }
+      return age >= 18;
+    }, { message: "Le client doit avoir au moins 18 ans" }),
+  adresse: z.string().min(1, "L'adresse est requise"),
+  codePostal: z.string().min(5, "Code postal invalide"),
+  ville: z.string().min(1, "La ville est requise"),
+  produit: z.string().min(1, "Le produit est requis"),
+  identifiantContrat: z.string().optional(),
+  carteSIM: z.string().optional(),
+  portabilite: z.string().optional(),
+  numeroPorter: z.string().optional(),
+  source: z.string().min(1, "La source est requise"),
+  typeRecommandation: z.string().optional(),
+  civiliteProspect: z.string().optional(),
+  prenomProspect: z.string().optional(),
+  nomProspect: z.string().optional(),
+  mobileProspect: z.string().optional(),
+  codePostalProspect: z.string().optional(),
+  villeProspect: z.string().optional(),
+  commentaire: z.string().optional(),
+  dateSignature: z.date().optional(),
+  dateRendezVous: z.date().optional(),
+  dateInstallation: z.date().optional(),
+  status: z.string().default("enregistre"),
+  userId: z.number(),
+}).refine((data) => {
+  // Validation conditionnelle des dates selon le statut
+  if (data.status === 'rendez-vous' && !data.dateRendezVous) {
+    return false;
+  }
+  if (data.status === 'installation' && !data.dateInstallation) {
+    return false;
+  }
+  return true;
+}, {
+  message: "Date obligatoire pour ce statut",
+  path: ["statusValidation"], // Chemin générique pour l'erreur
+}).refine((data) => {
+  // Vérifier format identifiant contrat selon produit choisi
+  if (data.produit) {
+    if (["Freebox Pop", "Freebox Essentiel", "Freebox Ultra"].includes(data.produit) && data.identifiantContrat) {
+      // Vérifier le format uniquement si un identifiant est fourni
+      if (!/^FO\d{8}$/.test(data.identifiantContrat)) {
+        return false;
+      }
+    } else if (data.produit === "Forfait 5G") {
+      if (data.identifiantContrat && !/^\d{8}$/.test(data.identifiantContrat)) {
+        return false;
+      }
+      // Vérifier que la carte SIM est sélectionnée pour Forfait 5G seulement si on est en phase avancée
+      // Cette condition est assouplie pour faciliter la création initiale
+    }
+  }
+  
+  // Vérifier la portabilité
+  if (data.portabilite === "Portabilité" && !data.numeroPorter) {
+    return false;
+  }
+  
+  // Pour source = Recommandation, vérifier les champs prospects 
+  // mais de façon moins stricte pour faciliter la création initiale
+  if (data.source === "Recommandation" && data.typeRecommandation === "Prospect") {
+    // Assouplissement pour la création initiale
+    // On ne vérifie pas tous les champs obligatoires au début
+  }
+
+  // Vérifier que la date de rendez-vous est fournie pour le statut "rendez-vous"
+  if (data.status === "rendez-vous" && !data.dateRendezVous) {
+    return false;
+  }
+
+  // Vérifier que la date d'installation est fournie pour le statut "installation"
+  if (data.status === "installation" && !data.dateInstallation) {
+    return false;
+  }
+  
+  return true;
+}, {
+  message: "Veuillez remplir tous les champs requis selon les règles spécifiques",
+  path: ["form"]
+});
+
+type FormValues = z.infer<typeof clientFormSchema>;
+
+const civiliteOptions = [
+  { value: "M.", label: "M" },
+  { value: "Mme", label: "Mme" },
+  { value: "Mlle", label: "Mlle" },
+];
+
+const sourceOptions = [
+  { value: "Prospection direct", label: "Prospection direct" },
+  { value: "Flyer", label: "Flyer" },
+  { value: "Recommandation", label: "Recommandation" },
+  { value: "Réseaux sociaux", label: "Réseaux sociaux" },
+  { value: "Site Web", label: "Site Web" },
+  { value: "Autocollant", label: "Autocollant" },
+  { value: "Stand", label: "Stand" },
+  { value: "Autre", label: "Autre" },
+];
+
+const produitOptions = [
+  { value: "Freebox Pop", label: "Freebox Pop" },
+  { value: "Freebox Essentiel", label: "Freebox Essentiel" },
+  { value: "Freebox Ultra", label: "Freebox Ultra" },
+  { value: "Forfait 5G", label: "Forfait 5G" },
+];
+
+const clientStatusOptions = [
+  { value: "enregistre", label: "Enregistré" },
+  { value: "valide", label: "Validé" },
+  { value: "valide_7j", label: "Validé 7 jours" },
+  { value: "rendez-vous", label: "Rendez-vous" },
+  { value: "installation", label: "Installation" },
+  { value: "post-production", label: "Post-production" },
+  { value: "resiliation", label: "Résiliation" },
+  { value: "abandonne", label: "Abandonné" },
+];
+
+const portabiliteOptions = [
+  { value: "Portabilité", label: "Portabilité" },
+  { value: "Création", label: "Création" },
+];
+
+const typeRecommandationOptions = [
+  { value: "Client", label: "Client" },
+  { value: "Prospect", label: "Prospect" },
+];
+
+export function ClientForm({ isOpen, onClose, client }: ClientFormProps) {
+  // Récupération des informations sur les droits de l'utilisateur
+  const { isAdmin, isVendeur, hasPermission, getUserRole } = useRole();
+  const { user } = useAuth();
+  
+  // Helper pour sécuriser tous les composants Select
+  const safeOnValueChange = (field: any, label: string, extraAction?: (value: string) => void) => {
+    return (value: string) => {
+      try {
+        // En production, on utilise un délai pour éviter les problèmes de rendu
+        if (isProduction) {
+          setTimeout(() => {
+            field.onChange(value);
+            // Exécuter une action supplémentaire si fournie
+            if (extraAction) {
+              extraAction(value);
+            }
+          }, 0);
+        } else {
+          // En développement, on applique directement
+          field.onChange(value);
+          // Exécuter une action supplémentaire si fournie
+          if (extraAction) {
+            extraAction(value);
+          }
+        }
+      } catch (err) {
+        console.error(`Erreur lors du changement de ${label}:`, err);
+      }
+    };
+  };
+  const { toast } = useToast();
+  const [activeTab, setActiveTab] = useState("personnel");
+  const [showSuccess, setShowSuccess] = useState(false);
+  const [isNewClient, setIsNewClient] = useState(false);
+  const [successClient, setSuccessClient] = useState<Client | null>(null);
+  const [dateSignatureOpen, setDateSignatureOpen] = useState(false);
+  
+  // Vérifier si nous sommes en mode consultation uniquement (depuis localStorage)
+  const isViewOnlyMode = localStorage.getItem('viewOnlyMode') === 'true';
+  
+  // Activer automatiquement le mode édition si aucun client n'est fourni (= nouveau client)
+  // Mais toujours désactiver le mode édition si nous sommes en mode consultation uniquement
+  const [editMode, setEditMode] = useState(isViewOnlyMode ? false : !client);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+
+  // Récupérer les cartes SIM disponibles depuis l'API
+  const { data: simCardsData } = useQuery({
+    queryKey: ["/api/sim-cards"],
+    queryFn: async () => {
+      // Ajouter le paramètre clientCreation=true pour permettre l'accès aux vendeurs
+      const res = await fetch("/api/sim-cards?statut=disponible&clientCreation=true");
+      if (!res.ok) throw new Error("Erreur lors de la récupération des cartes SIM");
+      return res.json();
+    },
+    enabled: isOpen, // Ne récupérer les cartes SIM que si le formulaire est ouvert
+  });
+
+  // Vérifier si le client a des détails de carte SIM dans sa réponse (nouvelle implémentation)
+  const clientSimCardDetails = client && 'carteSIMDetails' in client ? client.carteSIMDetails : null;
+  console.log("Détails de la carte SIM du client depuis la réponse:", clientSimCardDetails);
+  
+  // Récupérer la carte SIM du client actuel (si définie)
+  const { data: clientSimCard } = useQuery({
+    queryKey: ["/api/sim-cards", client?.carteSIM],
+    queryFn: async () => {
+      console.log(`Requête de carte SIM ${client?.carteSIM} pour le client`);
+      const res = await fetch(`/api/sim-cards/${client?.carteSIM}?debug=true`);
+      if (!res.ok) throw new Error("Erreur lors de la récupération de la carte SIM du client");
+      const data = await res.json();
+      console.log("Réponse de la carte SIM du client:", data);
+      return data;
+    },
+    enabled: isOpen && !!client?.carteSIM && !clientSimCardDetails, // Récupérer seulement si un client existe et a une carte SIM
+  });
+
+  // Options de cartes SIM à partir des données de l'API
+  // La structure de retour est {simCards: [...], stats: {...}}
+  const carteSIMOptions = useMemo(() => {
+    const options = simCardsData?.simCards?.map((card: any) => ({
+      value: card.id.toString(),
+      label: card.numero,
+    })) || [];
+    
+    // Ajouter la carte SIM du client actuel si elle n'est pas déjà dans la liste
+    if (clientSimCard && !options.some((option: any) => option.value === clientSimCard.id.toString())) {
+      console.log("Ajout de la carte SIM du client aux options:", clientSimCard.numero);
+      options.push({
+        value: clientSimCard.id.toString(),
+        label: clientSimCard.numero,
+      });
+    }
+    
+    // Ajouter également la carte SIM des détails du client si elle existe
+    if (clientSimCardDetails && typeof clientSimCardDetails === 'object' && 'id' in clientSimCardDetails && 'numero' in clientSimCardDetails) {
+      const simCardId = String(clientSimCardDetails.id);
+      const simCardNumero = String(clientSimCardDetails.numero);
+      
+      if (!options.some((option: any) => option.value === simCardId)) {
+        console.log("Ajout de la carte SIM des détails du client aux options:", simCardNumero);
+        options.push({
+          value: simCardId,
+          label: simCardNumero,
+        });
+      }
+    }
+    
+    console.log("Options de cartes SIM finales:", options);
+    return options;
+  }, [simCardsData, clientSimCard, clientSimCardDetails]);
+  
+  // Ajouter des logs pour déboguer
+  console.log("Client reçu dans le formulaire:", client);
+  
+  // Si c'est un nouveau client, passer directement en mode édition
+  useEffect(() => {
+    setEditMode(!client);
+  }, [client]);
+  
+  // Nous avons déplacé la logique de formatage directement dans l'événement onChange du champ de date
+
+
+  // Pour les états des datepickers
+  const [dateRendezVousOpen, setDateRendezVousOpen] = useState(false);
+  const [dateInstallationOpen, setDateInstallationOpen] = useState(false);
+  
+  const form = useForm<FormValues>({
+    resolver: zodResolver(clientFormSchema),
+    defaultValues: {
+          civilite: "",
+          prenom: "",
+          nom: "",
+          email: "",
+          mobile: "",
+          fixe: "",
+          dateNaissance: "",
+          adresse: "",
+          codePostal: "",
+          ville: "",
+          produit: "",
+          identifiantContrat: "",
+          carteSIM: "",
+          portabilite: "",
+          numeroPorter: "",
+          source: "",
+          typeRecommandation: "",
+          civiliteProspect: "",
+          prenomProspect: "",
+          nomProspect: "",
+          mobileProspect: "",
+          codePostalProspect: "",
+          villeProspect: "",
+          commentaire: "",
+          status: "enregistre",
+          userId: user?.id || 0,
+          dateSignature: new Date(),
+          dateRendezVous: undefined,
+          dateInstallation: undefined,
+    }
+  });
+  
+  // Utiliser useEffect pour réinitialiser le formulaire quand le client change
+  useEffect(() => {
+    // Vérifier d'abord si nous sommes en mode consultation uniquement
+    if (isViewOnlyMode) {
+      // Forcer le mode lecture seule
+      setEditMode(false);
+    } else {
+      // Définir le mode édition en fonction de la présence d'un client
+      setEditMode(!client);
+    }
+    
+    if (client && isOpen) {
+      console.log("Réinitialisation du formulaire avec les données du client:", client);
+      
+      // Prétraitement des noms si prenom/nom non renseignés mais que name existe
+      let extractedPrenom = client.prenom || "";
+      let extractedNom = client.nom || "";
+      
+      if (client.name && (!client.prenom || !client.nom)) {
+        const nameParts = client.name.split(' ');
+        if (nameParts.length >= 2) {
+          extractedPrenom = extractedPrenom || nameParts[0];
+          extractedNom = extractedNom || nameParts.slice(1).join(' ');
+        } else if (nameParts.length === 1) {
+          // Si un seul mot, considérer comme nom
+          extractedNom = extractedNom || nameParts[0];
+        }
+      }
+      
+      // Conversion des valeurs pour le formulaire
+      // Ajouter des logs pour déboguer les dates
+      console.log("Dates originales du client:", {
+        dateRendezVous: client.dateRendezVous,
+        dateInstallation: client.dateInstallation
+      });
+      
+      const formValues = {
+        ...client,
+        dateSignature: client.dateSignature ? new Date(client.dateSignature) : new Date(),
+        // Ajouter explicitement les dates de rendez-vous et d'installation
+        dateRendezVous: client.dateRendezVous ? new Date(client.dateRendezVous) : undefined,
+        dateInstallation: client.dateInstallation ? new Date(client.dateInstallation) : undefined,
+        userId: client.userId || user?.id || 0,
+        // Convertir les valeurs null en chaînes vides pour éviter les erreurs
+        prenom: extractedPrenom,
+        nom: extractedNom,
+        email: client.email || "",
+        mobile: client.phone || "",  // Noter que le champ s'appelle phone dans l'API mais mobile dans le formulaire
+        fixe: client.fixe || "",
+        dateNaissance: client.dateNaissance || "",
+        adresse: client.adresse || "",
+        codePostal: client.codePostal || "",
+        ville: client.ville || "",
+        produit: client.produit || "",
+        identifiantContrat: client.identifiantContrat || "",
+        carteSIM: client.carteSIM || "",
+        portabilite: client.portabilite || "",
+        numeroPorter: client.numeroPorter || "",
+        source: client.source || "",
+        typeRecommandation: client.typeRecommandation || "",
+        civiliteProspect: client.civiliteProspect || "",
+        prenomProspect: client.prenomProspect || "",
+        nomProspect: client.nomProspect || "",
+        mobileProspect: client.mobileProspect || "",
+        codePostalProspect: client.codePostalProspect || "",
+        villeProspect: client.villeProspect || "",
+        commentaire: client.commentaire || "",
+        status: client.status || "enregistre",
+        civilite: client.civilite || "",
+      };
+      
+      // Réinitialiser le formulaire avec toutes les valeurs en s'assurant qu'aucune n'est null
+      form.reset(formValues);
+    }
+  }, [client, isOpen, user?.id]);
+
+  const handleTabChange = (newTab: string) => {
+    // Avant de passer à un autre onglet, vérifier si les champs de l'onglet actuel sont valides
+    if (activeTab === "personnel") {
+      // Valider les champs de l'onglet personnel
+      const personnelFields = ["civilite", "prenom", "nom", "dateNaissance", "email", "mobile"];
+      const isValid = personnelFields.every(field => {
+        const fieldState = form.getFieldState(field as keyof FormValues);
+        return !fieldState.invalid;
+      });
+      
+      if (!isValid) {
+        toast({
+          title: "Erreur de validation",
+          description: "Veuillez corriger les erreurs dans l'onglet Personnel avant de continuer.",
+          variant: "destructive",
+        });
+        return;
+      }
+    } else if (activeTab === "adresse") {
+      // Valider les champs de l'onglet adresse
+      const adresseFields = ["adresse", "codePostal", "ville"];
+      const isValid = adresseFields.every(field => {
+        const fieldState = form.getFieldState(field as keyof FormValues);
+        return !fieldState.invalid;
+      });
+      
+      if (!isValid) {
+        toast({
+          title: "Erreur de validation",
+          description: "Veuillez corriger les erreurs dans l'onglet Adresse avant de continuer.",
+          variant: "destructive",
+        });
+        return;
+      }
+    } else if (activeTab === "contrat") {
+      // Valider les champs de l'onglet contrat
+      const contratFields = ["produit", "identifiantContrat", "dateSignature"];
+      const carteSIMFields = form.watch("produit") === "Forfait 5G" ? ["carteSIM", "portabilite"] : [];
+      const numeroPorterFields = form.watch("portabilite") === "Portabilité" ? ["numeroPorter"] : [];
+      
+      const allFields = [...contratFields, ...carteSIMFields, ...numeroPorterFields];
+      
+      let isValid = allFields.every(field => {
+        const fieldState = form.getFieldState(field as keyof FormValues);
+        return !fieldState.invalid;
+      });
+      
+      // Vérifications spécifiques selon le statut
+      const status = form.watch("status");
+      
+      if (status === "rendez-vous") {
+        const dateFields = ["dateRendezVous"];
+        isValid = isValid && dateFields.every(field => !form.formState.errors[field as keyof FormValues]);
+      } else if (status === "installation") {
+        const dateFields = ["dateInstallation"];
+        isValid = isValid && dateFields.every(field => !form.formState.errors[field as keyof FormValues]);
+      }
+      
+      if (!isValid) {
+        toast({
+          title: "Erreur de validation",
+          description: "Veuillez corriger les erreurs dans l'onglet Contrat avant de continuer.",
+          variant: "destructive",
+        });
+        return;
+      }
+    }
+    
+    setActiveTab(newTab);
+  };
+  
+  const updateClientMutation = useMutation({
+    mutationFn: async (data: FormValues) => {
+      if (!client) return; // Ne devrait pas arriver
+      
+      const res = await apiRequest("PUT", `/api/clients/${client.id}`, data);
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}));
+        throw new Error(errorData.message || "Erreur lors de la mise à jour du client");
+      }
+      return res.json();
+    },
+    onSuccess: (updatedClient) => {
+      queryClient.invalidateQueries({queryKey: ["/api/clients"]});
+      
+      // Enregistrer le client mis à jour et afficher le message de succès
+      setSuccessClient(updatedClient);
+      setShowSuccess(true);
+      // Ne pas fermer automatiquement, l'utilisateur cliquera sur le bouton "Retour à la liste"
+    },
+    onError: (error: Error) => {
+      toast({
+        title: "Erreur",
+        description: error.message,
+        variant: "destructive",
+      });
+    }
+  });
+  
+  const createClientMutation = useMutation({
+    mutationFn: async (data: FormValues) => {
+      // Nettoyage et préparation des données
+      const cleanedData = {
+        ...data,
+        // Conversion explicite des chaînes vides en null pour les champs optionnels
+        fixe: data.fixe?.trim() || null,
+        carteSIM: data.carteSIM?.trim() || null,
+        numeroPorter: data.numeroPorter?.trim() || null,
+        commentaire: data.commentaire?.trim() || null,
+        // Assurer que les chaînes sont non-vides pour les champs requis
+        nom: data.nom?.trim() || "",
+        prenom: data.prenom?.trim() || "",
+        // Assurer que les champs de date sont correctement formatés
+        dateSignature: data.dateSignature instanceof Date ? data.dateSignature : new Date(),
+        // Assurer que userId est un nombre
+        userId: Number(data.userId) || user?.id || 0,
+      };
+      
+      console.log("Données envoyées pour création du client:", JSON.stringify(cleanedData));
+      
+      const res = await apiRequest("POST", "/api/clients", cleanedData);
+      
+      // Obtenir le résultat même en cas d'erreur pour le diagnostic
+      const resultData = await res.json().catch((err) => {
+        console.error("Erreur lors du parsing de la réponse", err);
+        return { error: "Erreur inconnue lors du traitement de la réponse" };
+      });
+      
+      // Si la réponse n'est pas OK, lancer une erreur avec les détails
+      if (!res.ok) {
+        console.error("Échec de création du client:", resultData);
+        throw new Error(resultData.message || "Erreur lors de la création du client");
+      }
+      
+      console.log("Client créé avec succès:", resultData);
+      return resultData;
+    },
+    onSuccess: (savedClient) => {
+      queryClient.invalidateQueries({queryKey: ["/api/clients"]});
+      
+      // Si une carte SIM est associée, mettre à jour son statut
+      if (savedClient && savedClient.carteSIM) {
+        updateSimCardStatus(savedClient.carteSIM, savedClient.id);
+      }
+      
+      // Enregistrer le client créé et afficher le message de succès
+      setIsNewClient(true);
+      setSuccessClient(savedClient);
+      setShowSuccess(true);
+      // Ne pas fermer automatiquement, l'utilisateur cliquera sur le bouton "Retour à la liste"
+    },
+    onError: (error: Error) => {
+      console.error("Erreur mutation création client:", error);
+      toast({
+        title: "Erreur de création",
+        description: error.message || "Une erreur est survenue lors de la création du client",
+        variant: "destructive",
+      });
+    }
+  });
+
+  const deleteClientMutation = useMutation({
+    mutationFn: async () => {
+      if (!client) return; // Ne devrait pas arriver
+      
+      const res = await apiRequest("DELETE", `/api/clients/${client.id}`);
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}));
+        throw new Error(errorData.message || "Erreur lors de la suppression du client");
+      }
+      return res.json();
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({queryKey: ["/api/clients"]});
+      // Fermer la modal
+      onClose();
+      toast({
+        title: "Client supprimé",
+        description: "Le client a été supprimé avec succès",
+      });
+    },
+    onError: (error: Error) => {
+      toast({
+        title: "Erreur",
+        description: error.message,
+        variant: "destructive",
+      });
+    }
+  });
+  
+  const isPending = createClientMutation.isPending || updateClientMutation.isPending;
+
+  const onSubmit = (data: FormValues) => {
+    console.log("Données du formulaire:", data);
+    
+    // Forcer le champ userId avec l'ID de l'utilisateur connecté
+    data.userId = user?.id || 0;
+    
+    // Si le client existe, mettre à jour, sinon créer
+    if (client) {
+      setIsNewClient(false); // S'assurer que le drapeau est à false pour les mises à jour
+      updateClientMutation.mutate(data);
+      
+      // Si une carte SIM est affectée et différente de la carte précédente, mettre à jour son statut
+      if (data.carteSIM && data.carteSIM !== client.carteSIM) {
+        updateSimCardStatus(data.carteSIM, client.id);
+      }
+    } else {
+      // Pour un nouveau client avec carte SIM, le statut sera mis à jour dans le callback onSuccess
+      setIsNewClient(true);  // Définir qu'il s'agit d'un nouveau client
+      createClientMutation.mutate(data);
+    }
+  };
+  
+  // Fonction pour mettre à jour le statut d'une carte SIM
+  const updateSimCardStatus = async (simCardId: string, clientId: number) => {
+    try {
+      const response = await fetch(`/api/sim-cards/${simCardId}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          statut: 'Activé',
+          clientId: clientId
+        }),
+      });
+      
+      if (!response.ok) {
+        console.error('Erreur lors de la mise à jour du statut de la carte SIM');
+      } else {
+        console.log('Statut de la carte SIM mis à jour avec succès');
+        // Invalider la requête pour rafraîchir les données des cartes SIM
+        queryClient.invalidateQueries({queryKey: ["/api/sim-cards"]});
+      }
+    } catch (error) {
+      console.error('Erreur lors de la mise à jour de la carte SIM:', error);
+    }
+  };
+
+  // Nettoyer le localStorage lorsque le formulaire est fermé
+  const handleClose = () => {
+    // Supprimer le flag viewOnlyMode lorsque le formulaire est fermé
+    localStorage.removeItem('viewOnlyMode');
+    onClose();
+  };
+
+  return (
+    <Dialog open={isOpen} onOpenChange={handleClose}>
+      <DialogContent className="sm:max-w-[900px] max-h-[80vh] sm:max-h-[90vh] overflow-y-auto" hideCloseButton={true}>
+        <DialogTitle className="flex justify-between items-center bg-zinc-100 p-3 rounded-t-lg mb-2">
+          <div className="flex items-center">
+            <User className="mr-2 h-5 w-5" />
+            {client ? (
+              <span>
+                Client: {client.prenom} {client.nom}
+                <span className="ml-2">
+                  <StatusBadge 
+                    status={client.status || "enregistre"} 
+                    date={client.status?.toLowerCase() === "rendez-vous" || client.status?.toLowerCase() === "rdv" 
+                        ? client.date  // Utilisation du champ date existant dans le schéma
+                        : client.status?.toLowerCase() === "installation" 
+                          ? client.date  // Utilisation du champ date existant dans le schéma
+                          : null} 
+                  />
+                </span>
+              </span>
+            ) : (
+              "Nouveau client"
+            )}
+          </div>
+          <div className="flex items-center space-x-2">
+            {client && !isViewOnlyMode && (
+              <>
+                {!editMode ? (
+                  <Button 
+                    variant="outline" 
+                    size="sm"
+                    className="bg-blue-50 border-blue-200 text-blue-600 hover:bg-blue-100"
+                    onClick={() => setEditMode(true)}
+                  >
+                    <Pencil className="mr-1 h-4 w-4" />
+                    Modifier
+                  </Button>
+                ) : (
+                  <Button 
+                    variant="outline" 
+                    size="sm"
+                    className="bg-red-50 border-red-200 text-red-600 hover:bg-red-100"
+                    onClick={() => setConfirmDelete(true)}
+                  >
+                    <Trash2 className="mr-1 h-4 w-4" />
+                    Supprimer
+                  </Button>
+                )}
+              </>
+            )}
+            <Button variant="ghost" size="sm" onClick={handleClose} className="h-8 w-8 p-0">
+              <X className="h-4 w-4" />
+            </Button>
+          </div>
+        </DialogTitle>
+        
+        {/* Dialog to confirm delete */}
+        {confirmDelete && (
+          <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+            <div className="bg-white p-6 rounded-lg max-w-md w-full">
+              <div className="flex items-center mb-4 text-red-600">
+                <AlertTriangle className="h-6 w-6 mr-2" />
+                <h3 className="text-lg font-medium">Confirmer la suppression</h3>
+              </div>
+              <p className="mb-6">Êtes-vous sûr de vouloir supprimer ce client ? Cette action est irréversible.</p>
+              <div className="flex justify-end space-x-3">
+                <Button variant="outline" onClick={() => setConfirmDelete(false)}>
+                  Annuler
+                </Button>
+                <Button
+                  variant="destructive"
+                  onClick={() => {
+                    setConfirmDelete(false);
+                    deleteClientMutation.mutate();
+                  }}
+                >
+                  {deleteClientMutation.isPending ? (
+                    <>
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      Suppression...
+                    </>
+                  ) : (
+                    "Supprimer"
+                  )}
+                </Button>
+              </div>
+            </div>
+          </div>
+        )}
+        
+        {/* Success message overlay */}
+        {showSuccess ? (
+          // Rendu de message de succès simplifié et robuste
+          <div className="bg-white p-6 rounded-lg border-t border-gray-200">
+            <div className="flex flex-col items-center justify-center text-center">
+              <div className="w-16 h-16 bg-green-100 rounded-full flex items-center justify-center mb-4">
+                <ListChecks className="h-8 w-8 text-green-600" />
+              </div>
+              <h3 className="text-xl font-semibold text-gray-900 mb-3">
+                {isNewClient 
+                  ? "Félicitations pour cette nouvelle vente !" 
+                  : "Client mis à jour avec succès !"}
+              </h3>
+              <div className="mt-2 mb-6 text-base text-gray-700 max-w-md">
+                {isNewClient ? (
+                  <p>
+                    Bravo ! Vous avez ajouté{' '}
+                    <span className="font-medium text-indigo-600">{successClient?.prenom || ""} {successClient?.nom || ""}</span>{' '}
+                    à votre portefeuille client.
+                    <br />
+                    Le produit <span className="font-medium text-indigo-600">{successClient?.produit || ""}</span> a été enregistré avec succès.
+                    <br />
+                    Continuez votre excellent travail !
+                  </p>
+                ) : (
+                  <p>
+                    Les informations de <span className="font-medium text-indigo-600">{successClient?.prenom || ""} {successClient?.nom || ""}</span>{' '}
+                    ont été mises à jour avec succès.
+                    <br />
+                    Toutes les modifications ont été enregistrées dans la base de données.
+                  </p>
+                )}
+              </div>
+              <div className="flex flex-col gap-3 w-full max-w-xs mx-auto">
+                <Button
+                  type="button"
+                  onClick={() => {
+                    setShowSuccess(false);
+                    onClose();
+                    // Rediriger vers la page des clients
+                    window.location.href = "/clients";
+                  }}
+                  className="w-full bg-indigo-600 hover:bg-indigo-700 font-medium text-white"
+                >
+                  <ChevronLeft className="h-4 w-4 mr-2" />
+                  Retour à la liste des clients
+                </Button>
+                <Button
+                  type="button"
+                  onClick={() => {
+                    setShowSuccess(false);
+                    form.reset({
+                      civilite: "",
+                      prenom: "",
+                      nom: "",
+                      email: "",
+                      mobile: "",
+                      fixe: "",
+                      dateNaissance: "",
+                      adresse: "",
+                      codePostal: "",
+                      ville: "",
+                      produit: "",
+                      identifiantContrat: "",
+                      carteSIM: "",
+                      portabilite: "",
+                      numeroPorter: "",
+                      source: "",
+                      typeRecommandation: "",
+                      civiliteProspect: "",
+                      prenomProspect: "",
+                      nomProspect: "",
+                      mobileProspect: "",
+                      codePostalProspect: "",
+                      villeProspect: "",
+                      commentaire: "",
+                      status: "enregistre",
+                      userId: user?.id || 0,
+                      dateSignature: new Date(),
+                    });
+                  }}
+                  variant="outline"
+                  className="w-full border-gray-300 hover:bg-gray-50 text-gray-700"
+                >
+                  Ajouter un autre client
+                </Button>
+              </div>
+            </div>
+          </div>
+        ) : (
+          <Form {...form}>
+          <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">
+            <Tabs value={activeTab} onValueChange={handleTabChange} className="w-full bg-zinc-100 p-0 rounded-md">
+              <TabsList className="w-full grid grid-cols-4 rounded-t-md h-auto">
+                <TabsTrigger value="personnel" className="py-2 text-xs">
+                  <span>Personnel</span>
+                </TabsTrigger>
+                <TabsTrigger value="adresse" className="py-2 text-xs">
+                  <span>Adresse</span>
+                </TabsTrigger>
+                <TabsTrigger value="contrat" className="py-2 text-xs">
+                  <span>Contrat</span>
+                </TabsTrigger>
+                <TabsTrigger value="source" className="py-2 text-xs">
+                  <span>Infos</span>
+                </TabsTrigger>
+              </TabsList>
+              
+              <TabsContent value="personnel" className="bg-white p-4 rounded-md space-y-4 max-h-[60vh] overflow-y-auto">
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                  <FormField
+                    control={form.control}
+                    name="civilite"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel className="text-gray-700 font-medium">Civilité <span className="text-red-500">*</span></FormLabel>
+                        {isProduction ? (
+                          <FormControl>
+                            <ProductionSafeSelect
+                              value={field.value || ""}
+                              onValueChange={(value) => {
+                                console.log("Civilité sélectionnée:", value);
+                                field.onChange(value);
+                              }}
+                              options={civiliteOptions}
+                              placeholder="Sélectionner"
+                              disabled={client && !editMode}
+                              className="bg-white border-gray-200"
+                            />
+                          </FormControl>
+                        ) : (
+                          <Select
+                            onValueChange={(value) => field.onChange(value)}
+                            value={field.value || ""}
+                            defaultValue={field.value || ""}
+                            disabled={client && !editMode}
+                          >
+                            <FormControl>
+                              <SelectTrigger className="bg-white border-gray-200 h-10">
+                                <SelectValue placeholder="Sélectionner" />
+                              </SelectTrigger>
+                            </FormControl>
+                            <SelectContent>
+                              {civiliteOptions.map((option) => (
+                                <SelectItem key={option.value} value={option.value}>
+                                  {option.label}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        )}
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                  <FormField
+                    control={form.control}
+                    name="prenom"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel className="text-gray-700 font-medium">Prénom <span className="text-red-500">*</span></FormLabel>
+                        {client && !editMode ? (
+                          <div className="p-2 border rounded bg-gray-50">
+                            {field.value}
+                          </div>
+                        ) : (
+                          <FormControl>
+                            <Input 
+                              placeholder="Prénom" 
+                              className="bg-white border-gray-200 h-10" 
+                              {...field} 
+                            />
+                          </FormControl>
+                        )}
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                  <FormField
+                    control={form.control}
+                    name="nom"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel className="text-gray-700 font-medium">Nom <span className="text-red-500">*</span></FormLabel>
+                        {client && !editMode ? (
+                          <div className="p-2 border rounded bg-gray-50">
+                            {field.value}
+                          </div>
+                        ) : (
+                          <FormControl>
+                            <Input 
+                              placeholder="Nom" 
+                              className="bg-white border-gray-200 h-10"
+                              {...field} 
+                            />
+                          </FormControl>
+                        )}
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                </div>
+                
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <FormField
+                    control={form.control}
+                    name="email"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel className="text-gray-700 font-medium">Email <span className="text-red-500">*</span></FormLabel>
+                        {client && !editMode ? (
+                          <div className="p-2 border rounded bg-gray-50">
+                            {field.value}
+                          </div>
+                        ) : (
+                          <FormControl>
+                            <Input 
+                              placeholder="email@exemple.com" 
+                              className="bg-white border-gray-200 h-10" 
+                              {...field} 
+                            />
+                          </FormControl>
+                        )}
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                  <FormField
+                    control={form.control}
+                    name="dateNaissance"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel className="text-gray-700 font-medium">Date de naissance <span className="text-red-500">*</span></FormLabel>
+                        {client && !editMode ? (
+                          <div className="p-2 border rounded bg-gray-50">
+                            {field.value}
+                          </div>
+                        ) : (
+                          <FormControl>
+                            <Input 
+                              placeholder="JJ/MM/AAAA" 
+                              className="bg-white border-gray-200 h-10"
+                              {...field}
+                              onChange={(e) => {
+                                let value = e.target.value;
+                                // Formater automatiquement la date
+                                if (value.length === 2 && !value.includes('/')) {
+                                  value += '/';
+                                } else if (value.length === 5 && !value.substring(3).includes('/')) {
+                                  value += '/';
+                                }
+                                
+                                field.onChange(value);
+                              }}
+                            />
+                          </FormControl>
+                        )}
+                        <FormDescription className="text-xs text-gray-500">
+                          Format: JJ/MM/AAAA
+                        </FormDescription>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                </div>
+                
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <FormField
+                    control={form.control}
+                    name="mobile"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel className="text-gray-700 font-medium">Mobile <span className="text-red-500">*</span></FormLabel>
+                        {client && !editMode ? (
+                          <div className="p-2 border rounded bg-gray-50">
+                            {field.value}
+                          </div>
+                        ) : (
+                          <FormControl>
+                            <Input 
+                              placeholder="06 ou 07 XX XX XX XX" 
+                              className="bg-white border-gray-200 h-10"
+                              {...field} 
+                            />
+                          </FormControl>
+                        )}
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                  <FormField
+                    control={form.control}
+                    name="fixe"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel className="text-gray-700 font-medium">Téléphone fixe</FormLabel>
+                        {client && !editMode ? (
+                          <div className="p-2 border rounded bg-gray-50">
+                            {field.value || "Non spécifié"}
+                          </div>
+                        ) : (
+                          <FormControl>
+                            <Input 
+                              placeholder="01 XX XX XX XX" 
+                              className="bg-white border-gray-200 h-10"
+                              {...field} 
+                            />
+                          </FormControl>
+                        )}
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                </div>
+                
+                <div className="flex justify-end">
+                  <Button
+                    type="button"
+                    onClick={() => handleTabChange("adresse")}
+                    className="bg-blue-600 hover:bg-blue-700 text-white"
+                    disabled={isPending}
+                  >
+                    Suivant
+                  </Button>
+                </div>
+              </TabsContent>
+              
+              <TabsContent value="adresse" className="bg-white p-4 rounded-md space-y-4 max-h-[60vh] overflow-y-auto">
+                <FormField
+                  control={form.control}
+                  name="adresse"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel className="text-gray-700 font-medium">Adresse <span className="text-red-500">*</span></FormLabel>
+                      {client && !editMode ? (
+                        <div className="p-2 border rounded bg-gray-50">
+                          {field.value}
+                        </div>
+                      ) : (
+                        <FormControl>
+                          <Input 
+                            placeholder="Numéro et nom de rue" 
+                            className="bg-white border-gray-200 h-10" 
+                            {...field} 
+                          />
+                        </FormControl>
+                      )}
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <FormField
+                    control={form.control}
+                    name="codePostal"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel className="text-gray-700 font-medium">Code postal <span className="text-red-500">*</span></FormLabel>
+                        {client && !editMode ? (
+                          <div className="p-2 border rounded bg-gray-50">
+                            {field.value}
+                          </div>
+                        ) : (
+                          <FormControl>
+                            <Input
+                              placeholder="Code postal"
+                              className="bg-white border-gray-200 h-10"
+                              {...field}
+                              onChange={async (e) => {
+                                const value = e.target.value;
+                                field.onChange(value);
+                                
+                                // Si la longueur du code postal est 5, essayer de récupérer la ville
+                                if (value.length === 5) {
+                                  try {
+                                    const communes = await getCommunesByCodePostal(value);
+                                    if (communes.length === 1) {
+                                      // S'il n'y a qu'une seule commune, la sélectionner automatiquement
+                                      form.setValue("ville", communes[0].nom);
+                                    }
+                                  } catch (error) {
+                                    console.error("Erreur lors de la récupération des communes:", error);
+                                  }
+                                }
+                              }}
+                            />
+                          </FormControl>
+                        )}
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                  <FormField
+                    control={form.control}
+                    name="ville"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel className="text-gray-700 font-medium">Ville <span className="text-red-500">*</span></FormLabel>
+                        {client && !editMode ? (
+                          <div className="p-2 border rounded bg-gray-50">
+                            {field.value}
+                          </div>
+                        ) : (
+                          <FormControl>
+                            <CommuneInput
+                              value={field.value}
+                              onChange={field.onChange}
+                              codePostal={form.watch("codePostal")}
+                              className="bg-white border-gray-200 h-10"
+                              placeholder="Ville"
+                            />
+                          </FormControl>
+                        )}
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                </div>
+                
+                <div className="flex justify-between mt-4">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => handleTabChange("personnel")}
+                    className="bg-white"
+                  >
+                    <ChevronLeft className="h-4 w-4 mr-1" />
+                    Précédent
+                  </Button>
+                  <Button
+                    type="button"
+                    onClick={() => handleTabChange("contrat")}
+                    className="bg-blue-600 hover:bg-blue-700 text-white"
+                    disabled={isPending}
+                  >
+                    Suivant
+                  </Button>
+                </div>
+              </TabsContent>
+              
+              <TabsContent value="contrat" className="bg-white p-4 rounded-md space-y-4 max-h-[60vh] overflow-y-auto">
+                {/* Import et utilisation du composant optimisé */}
+                <ClientFormContratTab
+                  form={form}
+                  handleTabChange={handleTabChange}
+                  clientStatusOptions={clientStatusOptions}
+                  produitOptions={produitOptions}
+                  carteSIMOptions={carteSIMOptions}
+                  portabiliteOptions={portabiliteOptions}
+                  client={client}
+                  editMode={editMode}
+                  isPending={isPending}
+                  dateSignatureOpen={dateSignatureOpen}
+                  setDateSignatureOpen={setDateSignatureOpen}
+                  dateRendezVousOpen={dateRendezVousOpen}
+                  setDateRendezVousOpen={setDateRendezVousOpen}
+                  dateInstallationOpen={dateInstallationOpen}
+                  setDateInstallationOpen={setDateInstallationOpen}
+                />
+              </TabsContent>
+
+              <TabsContent value="source" className="bg-white p-4 rounded-md space-y-4 max-h-[60vh] overflow-y-auto">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {/* Source */}
+                  <FormField
+                    control={form.control}
+                    name="source"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel className="text-gray-700 font-medium">Source <span className="text-red-500">*</span></FormLabel>
+                        {isProduction ? (
+                          <FormControl>
+                            <SimpleSelect
+                              options={sourceOptions}
+                              value={field.value || ""}
+                              onChange={(value) => {
+                                field.onChange(value);
+                                // Réinitialiser les champs de recommandation si nécessaire
+                                if (value !== "Recommandation") {
+                                  // Utiliser batch pour optimiser les performances
+                                  setTimeout(() => {
+                                    form.setValue("typeRecommandation", "");
+                                    form.setValue("civiliteProspect", "");
+                                    form.setValue("prenomProspect", "");
+                                    form.setValue("nomProspect", "");
+                                    form.setValue("mobileProspect", "");
+                                    form.setValue("codePostalProspect", "");
+                                    form.setValue("villeProspect", "");
+                                  }, 50);
+                                }
+                              }}
+                              placeholder="Sélectionner une source"
+                              disabled={client && !editMode}
+                            />
+                          </FormControl>
+                        ) : (
+                          <Select
+                            onValueChange={(value) => {
+                              field.onChange(value);
+                              // Réinitialiser les champs de recommandation si nécessaire
+                              if (value !== "Recommandation") {
+                                setTimeout(() => {
+                                  form.setValue("typeRecommandation", "");
+                                  form.setValue("civiliteProspect", "");
+                                  form.setValue("prenomProspect", "");
+                                  form.setValue("nomProspect", "");
+                                  form.setValue("mobileProspect", "");
+                                  form.setValue("codePostalProspect", "");
+                                  form.setValue("villeProspect", "");
+                                }, 50);
+                              }
+                            }}
+                            value={field.value || ""}
+                            defaultValue={field.value || ""}
+                            disabled={client && !editMode}
+                          >
+                            <FormControl>
+                              <SelectTrigger className="bg-white border-gray-200 h-10">
+                                <SelectValue placeholder="Sélectionner une source" />
+                              </SelectTrigger>
+                            </FormControl>
+                            <SelectContent>
+                              {sourceOptions.map((option) => (
+                                <SelectItem key={option.value} value={option.value}>
+                                  {option.label}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        )}
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                  {/* Statut du client */}
+                  <FormField
+                    control={form.control}
+                    name="status"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel className="text-gray-700 font-medium">Statut du client <span className="text-red-500">*</span></FormLabel>
+                        {isProduction ? (
+                          <FormControl>
+                            <SimpleSelect
+                              options={clientStatusOptions}
+                              value={field.value || ""}
+                              onChange={(value) => {
+                                field.onChange(value);
+                                // Ouvrir automatiquement le calendrier si nécessaire
+                                if (value === 'rendez-vous') {
+                                  setTimeout(() => setDateRendezVousOpen(true), 100);
+                                } else if (value === 'installation') {
+                                  setTimeout(() => setDateInstallationOpen(true), 100);
+                                }
+                              }}
+                              placeholder="Sélectionner un statut"
+                              disabled={client && !editMode}
+                            />
+                          </FormControl>
+                        ) : (
+                          <Select
+                            onValueChange={(value) => {
+                              field.onChange(value);
+                              // Ouvrir automatiquement le calendrier si nécessaire
+                              if (value === 'rendez-vous') {
+                                setTimeout(() => setDateRendezVousOpen(true), 100);
+                              } else if (value === 'installation') {
+                                setTimeout(() => setDateInstallationOpen(true), 100);
+                              }
+                            }}
+                            value={field.value || ""}
+                            defaultValue={field.value || ""}
+                            disabled={client && !editMode}
+                          >
+                            <FormControl>
+                              <SelectTrigger className="bg-white border-gray-200 h-10">
+                                <SelectValue placeholder="Sélectionner un statut" />
+                              </SelectTrigger>
+                            </FormControl>
+                            <SelectContent>
+                              {clientStatusOptions.map((option) => (
+                                <SelectItem key={option.value} value={option.value}>
+                                  {option.label}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        )}
+                        <FormDescription className="text-xs">
+                          Le statut détermine l'étape dans le parcours client
+                        </FormDescription>
+                        {field.value === 'installation' && form.getValues('dateInstallation') && (
+                          <div className="mt-1 text-sm text-green-700 font-medium flex items-center">
+                            <span className="inline-block h-2 w-2 rounded-full bg-green-500 mr-2"></span>
+                            Date d'installation: {(() => {
+                              try {
+                                const dateValue = form.getValues('dateInstallation');
+                                return dateValue ? format(new Date(dateValue), 'dd/MM/yyyy', { locale: fr }) : '';
+                              } catch (e) {
+                                console.error("Erreur formatage date:", e);
+                                return '';
+                              }
+                            })()}
+                          </div>
+                        )}
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                          <SaferSelect
+                            field={field}
+                            label="source"
+                            options={sourceOptions}
+                            placeholder="Sélectionner une source"
+                            disabled={client && !editMode}
+                            extraAction={(value) => {
+                              // Réinitialiser les champs de recommandation si nécessaire
+                              if (value !== "Recommandation") {
+                                // Utiliser batch pour optimiser les performances
+                                setTimeout(() => {
+                                  form.setValue("typeRecommandation", "");
+                                  form.setValue("civiliteProspect", "");
+                                  form.setValue("prenomProspect", "");
+                                  form.setValue("nomProspect", "");
+                                  form.setValue("mobileProspect", "");
+                                  form.setValue("codePostalProspect", "");
+                                  form.setValue("villeProspect", "");
+                                }, 50);
+                              }
+                            }}
+                          />
+                        )}
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                  
+                  {form.watch("source") === "Recommandation" && (
+                    <FormField
+                      control={form.control}
+                      name="typeRecommandation"
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel className="text-gray-700 font-medium">Type de recommandation <span className="text-red-500">*</span></FormLabel>
+                          {isProduction ? (
+                            <FormControl>
+                              <SimpleSelect
+                                options={typeRecommandationOptions}
+                                value={field.value || ""}
+                                onChange={(value) => {
+                                  field.onChange(value);
+                                }}
+                                placeholder="Sélectionner un type"
+                                disabled={client && !editMode}
+                              />
+                            </FormControl>
+                          ) : (
+                            <Select
+                              onValueChange={safeOnValueChange(field, "type de recommandation")}
+                              value={field.value || ""}
+                              defaultValue={field.value || ""}
+                              disabled={client && !editMode}
+                            >
+                              <FormControl>
+                                <SelectTrigger className="bg-white border-gray-200 h-10">
+                                  <SelectValue placeholder="Sélectionner un type" />
+                                </SelectTrigger>
+                              </FormControl>
+                              <SelectContent>
+                                {typeRecommandationOptions.map((option) => (
+                                  <SelectItem key={option.value} value={option.value}>
+                                    {option.label}
+                                  </SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                          )}
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                  )}
+                </div>
+
+                {/* Date de rendez-vous (conditionnelle si le statut est "rendez-vous") */}
+                {(form.watch('status') === 'rendez-vous' || form.getValues('dateRendezVous')) && (
+                  <FormField
+                    control={form.control}
+                    name="dateRendezVous"
+                    render={({ field }) => (
+                      <FormItem className="flex flex-col">
+                        <FormLabel className="text-gray-700 font-medium">
+                          Date de rendez-vous
+                          {form.watch('status') === 'rendez-vous' && <span className="text-red-500"> *</span>}
+                        </FormLabel>
+                        <Popover
+                          open={dateRendezVousOpen}
+                          onOpenChange={setDateRendezVousOpen}
+                        >
+                          <PopoverTrigger asChild>
+                            <FormControl>
+                              <Button
+                                variant="outline"
+                                className={`w-full h-10 bg-white border-gray-200 font-normal justify-start text-left ${!field.value ? 'text-muted-foreground' : ''}`}
+                                disabled={client && !editMode}
+                              >
+                                <Calendar className="mr-2 h-4 w-4" />
+                                {field.value ? format(new Date(field.value), 'dd/MM/yyyy', { locale: fr }) : "Sélectionner une date"}
+                              </Button>
+                            </FormControl>
+                          </PopoverTrigger>
+                          <PopoverContent className="w-auto p-0" align="start">
+                            <CalendarComponent
+                              mode="single"
+                              selected={field.value ? new Date(field.value) : undefined}
+                              onSelect={(date) => {
+                                field.onChange(date);
+                                setDateRendezVousOpen(false); // Ferme automatiquement le calendrier après sélection
+                              }}
+                              locale={fr}
+                              disabled={client && !editMode}
+                              initialFocus
+                            />
+                          </PopoverContent>
+                        </Popover>
+                        <FormDescription className="text-xs">
+                          {form.watch('status') === 'rendez-vous' 
+                            ? "Date obligatoire pour le statut 'Rendez-vous'" 
+                            : "Date du rendez-vous avec le client"}
+                        </FormDescription>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                )}
+
+                {/* Date d'installation (conditionnelle si le statut est "installation") */}
+                {(form.watch('status') === 'installation' || form.getValues('dateInstallation')) && (
+                  <FormField
+                    control={form.control}
+                    name="dateInstallation"
+                    render={({ field }) => (
+                      <FormItem className="flex flex-col">
+                        <FormLabel className="text-gray-700 font-medium">
+                          Date d'installation
+                          {form.watch('status') === 'installation' && <span className="text-red-500"> *</span>}
+                        </FormLabel>
+                        <Popover
+                          open={dateInstallationOpen}
+                          onOpenChange={setDateInstallationOpen}
+                        >
+                          <PopoverTrigger asChild>
+                            <FormControl>
+                              <Button
+                                variant="outline"
+                                className={`w-full h-10 bg-white border-gray-200 font-normal justify-start text-left ${!field.value ? 'text-muted-foreground' : ''}`}
+                                disabled={client && !editMode}
+                              >
+                                <Calendar className="mr-2 h-4 w-4" />
+                                {field.value ? format(new Date(field.value), 'dd/MM/yyyy', { locale: fr }) : "Sélectionner une date"}
+                              </Button>
+                            </FormControl>
+                          </PopoverTrigger>
+                          <PopoverContent className="w-auto p-0" align="start">
+                            <CalendarComponent
+                              mode="single"
+                              selected={field.value ? new Date(field.value) : undefined}
+                              onSelect={(date) => {
+                                field.onChange(date);
+                                setDateInstallationOpen(false); // Ferme automatiquement le calendrier après sélection
+                              }}
+                              locale={fr}
+                              disabled={client && !editMode}
+                              initialFocus
+                            />
+                          </PopoverContent>
+                        </Popover>
+                        <FormDescription className="text-xs">
+                          {form.watch('status') === 'installation' 
+                            ? "Date obligatoire pour le statut 'Installation'" 
+                            : "Date d'installation prévue"}
+                        </FormDescription>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                )}
+                
+                {/* Commentaire */}
+                <FormField
+                  control={form.control}
+                  name="commentaire"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel className="text-gray-700 font-medium">Commentaire</FormLabel>
+                      {client && !editMode ? (
+                        <div className="p-2 border rounded bg-gray-50 min-h-[80px]">
+                          {field.value || "Aucun commentaire"}
+                        </div>
+                      ) : (
+                        <FormControl>
+                          <Textarea 
+                            placeholder="Ajoutez un commentaire..." 
+                            className="bg-white border-gray-200 min-h-[80px]"
+                            {...field} 
+                          />
+                        </FormControl>
+                      )}
+                      <FormDescription className="text-xs">
+                        Informations complémentaires sur le client
+                      </FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                
+                {form.watch("source") === "Recommandation" && form.watch("typeRecommandation") === "Prospect" && (
+                  <div className="space-y-4 border-t pt-4 mt-4">
+                    <h3 className="text-gray-800 font-medium">Informations sur le prospect recommandeur</h3>
+                    
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                      <FormField
+                        control={form.control}
+                        name="civiliteProspect"
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel className="text-gray-700 font-medium">Civilité <span className="text-red-500">*</span></FormLabel>
+                            <Select
+                              onValueChange={safeOnValueChange(field, "civilité prospect")}
+                              value={field.value || ""}
+                              defaultValue={field.value || ""}
+                              disabled={client && !editMode}
+                            >
+                              <FormControl>
+                                <SelectTrigger className="bg-white border-gray-200 h-10">
+                                  <SelectValue placeholder="Sélectionner" />
+                                </SelectTrigger>
+                              </FormControl>
+                              <SelectContent>
+                                {civiliteOptions.map((option) => (
+                                  <SelectItem key={option.value} value={option.value}>
+                                    {option.label}
+                                  </SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+                      
+                      <FormField
+                        control={form.control}
+                        name="prenomProspect"
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel className="text-gray-700 font-medium">Prénom <span className="text-red-500">*</span></FormLabel>
+                            {client && !editMode ? (
+                              <div className="p-2 border rounded bg-gray-50">
+                                {field.value || "Non spécifié"}
+                              </div>
+                            ) : (
+                              <FormControl>
+                                <Input 
+                                  placeholder="Prénom du prospect" 
+                                  className="bg-white border-gray-200 h-10"
+                                  {...field} 
+                                />
+                              </FormControl>
+                            )}
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+                      
+                      <FormField
+                        control={form.control}
+                        name="nomProspect"
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel className="text-gray-700 font-medium">Nom <span className="text-red-500">*</span></FormLabel>
+                            {client && !editMode ? (
+                              <div className="p-2 border rounded bg-gray-50">
+                                {field.value || "Non spécifié"}
+                              </div>
+                            ) : (
+                              <FormControl>
+                                <Input 
+                                  placeholder="Nom du prospect" 
+                                  className="bg-white border-gray-200 h-10"
+                                  {...field} 
+                                />
+                              </FormControl>
+                            )}
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+                    </div>
+                    
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                      <FormField
+                        control={form.control}
+                        name="mobileProspect"
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel className="text-gray-700 font-medium">Mobile <span className="text-red-500">*</span></FormLabel>
+                            {client && !editMode ? (
+                              <div className="p-2 border rounded bg-gray-50">
+                                {field.value || "Non spécifié"}
+                              </div>
+                            ) : (
+                              <FormControl>
+                                <Input 
+                                  placeholder="Mobile du prospect" 
+                                  className="bg-white border-gray-200 h-10"
+                                  {...field} 
+                                />
+                              </FormControl>
+                            )}
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+                      
+                      <FormField
+                        control={form.control}
+                        name="codePostalProspect"
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel className="text-gray-700 font-medium">Code postal <span className="text-red-500">*</span></FormLabel>
+                            {client && !editMode ? (
+                              <div className="p-2 border rounded bg-gray-50">
+                                {field.value || "Non spécifié"}
+                              </div>
+                            ) : (
+                              <FormControl>
+                                <Input 
+                                  placeholder="Code postal du prospect" 
+                                  className="bg-white border-gray-200 h-10"
+                                  {...field}
+                                  onChange={async (e) => {
+                                    const value = e.target.value;
+                                    field.onChange(value);
+                                    
+                                    // Si la longueur du code postal est 5, essayer de récupérer la ville
+                                    if (value.length === 5) {
+                                      try {
+                                        const communes = await getCommunesByCodePostal(value);
+                                        if (communes.length === 1) {
+                                          // S'il n'y a qu'une seule commune, la sélectionner automatiquement
+                                          form.setValue("villeProspect", communes[0].nom);
+                                        }
+                                      } catch (error) {
+                                        console.error("Erreur lors de la récupération des communes:", error);
+                                      }
+                                    }
+                                  }}
+                                />
+                              </FormControl>
+                            )}
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+                      
+                      <FormField
+                        control={form.control}
+                        name="villeProspect"
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel className="text-gray-700 font-medium">Ville <span className="text-red-500">*</span></FormLabel>
+                            {client && !editMode ? (
+                              <div className="p-2 border rounded bg-gray-50">
+                                {field.value || "Non spécifié"}
+                              </div>
+                            ) : (
+                              <FormControl>
+                                <CommuneInput
+                                  value={field.value}
+                                  onChange={field.onChange}
+                                  codePostal={form.watch("codePostalProspect")}
+                                  className="bg-white border-gray-200 h-10"
+                                  placeholder="Ville du prospect"
+                                />
+                              </FormControl>
+                            )}
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+                    </div>
+                  </div>
+                )}
+                
+                <div className="flex justify-between mt-4">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => handleTabChange("contrat")}
+                    className="bg-white"
+                  >
+                    <ChevronLeft className="h-4 w-4 mr-1" />
+                    Précédent
+                  </Button>
+                  <Button
+                    type="submit"
+                    className="bg-green-600 hover:bg-green-700 text-white"
+                    disabled={isPending || (client && !editMode)}
+                  >
+                    {isPending ? (
+                      <>
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                        Enregistrement...
+                      </>
+                    ) : (
+                      client ? "Mettre à jour" : "Enregistrer"
+                    )}
+                  </Button>
+                </div>
+              </TabsContent>
+            </Tabs>
+          </form>
+        </Form>
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}

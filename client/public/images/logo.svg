@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="300" height="100" viewBox="0 0 300 100">
+  <style>
+    .smg-navy { fill: #2E2A5E; }
+    .smg-blue { fill: #3583C5; }
+    .smg-text { fill: #3583C5; font-family: Arial, sans-serif; font-weight: bold; font-size: 14px; }
+  </style>
+  
+  <!-- S Letter -->
+  <path class="smg-navy" d="M30,25 C40,25 50,30 50,40 C50,50 40,55 30,55 C20,55 20,60 30,60 C40,60 45,55 45,55 L50,65 C50,65 42,70 30,70 C10,70 10,50 30,50 C45,50 40,35 30,35 C20,35 15,40 15,40 L10,30 C10,30 18,25 30,25" />
+  
+  <!-- N Letter with M Combination -->
+  <path class="smg-navy" d="M60,25 L70,25 L70,70 L60,70 L60,25 Z" />
+  <path class="smg-blue" d="M70,25 L90,45 L110,25 L110,70 L100,70 L100,45 L90,55 L80,45 L80,70 L70,70 L70,25 Z" />
+  
+  <!-- G Letter -->
+  <path class="smg-navy" d="M155,40 C155,30 165,25 175,25 C185,25 195,30 195,30 L190,40 C190,40 185,35 175,35 C170,35 165,38 165,45 C165,52 170,60 180,60 C185,60 190,58 190,58 L190,50 L175,50 L175,42 L200,42 L200,65 C200,65 190,70 175,70 C155,70 155,55 155,40 Z" />
+  
+  <!-- SYNERGIE MARKETING GROUP Text -->
+  <text x="50" y="90" class="smg-text">SYNERGIE MARKETING GROUP</text>
+</svg>

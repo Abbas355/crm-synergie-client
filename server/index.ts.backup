@@ -1,0 +1,77 @@
+import express from "express";
+import type { Request, Response, NextFunction } from "express";
+
+const app = express();
+app.use(express.json());
+app.use(express.urlencoded({ extended: false }));
+
+app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
+  const status = err.status || err.statusCode || 500;
+  const message = err.message || "Internal Server Error";
+
+  console.error("Server error:", err);
+  res.status(status).json({ message });
+});
+
+// Configuration Vite après le démarrage des routes
+
+// Routes API et serveur
+(async () => {
+  try {
+    console.log("Démarrage application...");
+    
+    // Initialisation de la base de données
+    console.log("Initialisation connexion base de données...");
+    
+    // IMPORTANT : Enregistrer les routes API AVANT Vite pour éviter l'interception
+    const { registerRoutes } = await import("./routes");
+    await registerRoutes(app);
+    console.log("Routes API enregistrées");
+    
+    // Configuration Vite APRÈS les routes API
+    let server;
+    if (process.env.NODE_ENV !== "production") {
+      try {
+        const { setupVite } = await import("./vite");
+        const http = await import("http");
+        server = http.createServer(app);
+        await setupVite(app, server);
+        console.log("Vite configuré pour le développement");
+      } catch (error) {
+        console.log("Configuration Vite non disponible:", error);
+      }
+    } else {
+      // Configuration production optimisée
+      const { setupProductionServer } = await import("./production");
+      setupProductionServer(app);
+      console.log("Configuration production activée");
+    }
+    
+    const port = process.env.PORT ? parseInt(process.env.PORT) : 5000;
+    
+    const serverInstance = app.listen(port, "0.0.0.0", () => {
+      console.log(`Serveur démarré sur le port ${port} en mode ${process.env.NODE_ENV || 'development'}`);
+    });
+
+    // Gestion propre de l'arrêt du serveur
+    process.on('SIGTERM', () => {
+      console.log('SIGTERM reçu, arrêt du serveur...');
+      serverInstance.close(() => {
+        console.log('Serveur fermé proprement');
+        process.exit(0);
+      });
+    });
+
+    process.on('SIGINT', () => {
+      console.log('SIGINT reçu, arrêt du serveur...');
+      serverInstance.close(() => {
+        console.log('Serveur fermé proprement');
+        process.exit(0);
+      });
+    });
+
+  } catch (error) {
+    console.error("Erreur démarrage:", error);
+    process.exit(1);
+  }
+})();

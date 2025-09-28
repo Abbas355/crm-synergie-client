@@ -1,0 +1,1349 @@
+import { useState, useEffect, useMemo } from "react";
+import { z } from "zod";
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { useToast } from "@/hooks/use-toast";
+import { useRole } from "@/hooks/use-role";
+import { 
+  Form, 
+  FormControl, 
+  FormField, 
+  FormItem, 
+  FormLabel, 
+  FormMessage 
+} from "@/components/ui/form";
+import { FormProgressGamified, type FormProgressField } from "@/components/form-progress-gamified";
+import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
+import { 
+  Select, 
+  SelectContent, 
+  SelectItem, 
+  SelectTrigger, 
+  SelectValue 
+} from "@/components/ui/select";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Card, CardContent } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Label } from "@/components/ui/label";
+import { ClientStatusSelector } from "@/components/clients/client-status-selector-simple";
+import { AlertCircle, CalendarIcon, Info } from "lucide-react";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
+import { Calendar } from "@/components/ui/calendar";
+import { 
+  Alert, 
+  AlertDescription, 
+  AlertTitle 
+} from "@/components/ui/alert";
+import { format } from "date-fns";
+import { fr } from "date-fns/locale";
+import { Switch } from "@/components/ui/switch";
+import { DateInputFormatter } from "@/components/date-input-formatter";
+import { PostalCodeAutocomplete } from "@/components/postal-code-autocomplete";
+
+// Schéma de validation
+const clientFormSchema = z
+  .object({
+    civilite: z.string().min(1, "La civilité est requise"),
+    prenom: z.string().min(1, "Le prénom est requis"),
+    nom: z.string().min(1, "Le nom est requis"),
+    email: z.string().email("Email invalide").min(1, "L'email est requis"),
+    phone: z.string().optional(),
+    dateNaissance: z.string().min(1, "La date de naissance est requise"),
+    adresse: z.string().optional(),
+    codePostal: z.string().optional(),
+    ville: z.string().optional(),
+    status: z.string().min(1, "Le statut est requis"),
+    forfaitType: z.string().optional(),
+    dateSignature: z.string().optional(),
+    dateRendezVous: z.string().optional(),
+    dateInstallation: z.string().optional(),
+    commentaire: z.string().optional(),
+    codeVendeur: z.string().optional(),
+    // Champs pour le forfait 5G
+    portabilite: z.string().optional(),
+    carteSIM: z.string().optional(),
+    numeroPorter: z.string().optional(),
+    // Champs pour les documents (maintenant source)
+    mandatSepa: z.boolean().optional().default(false),
+    contratSigne: z.boolean().optional().default(false),
+    bonCommande: z.boolean().optional().default(false),
+    ribClient: z.boolean().optional().default(false),
+    copiePieceIdentite: z.boolean().optional().default(false),
+    attestationHonneur: z.boolean().optional().default(false),
+    // Nouveaux champs pour la source
+    source: z.string().min(1, "La source est requise"),
+    typeRecommandation: z.string().optional(),
+    clientRecommandation: z.number().optional(),
+    // Champs pour le prospect de recommandation
+    prospectCivilite: z.string().optional(),
+    prospectPrenom: z.string().optional(),
+    prospectNom: z.string().optional(),
+    prospectMobile: z.string().optional(),
+    prospectCodePostal: z.string().optional(),
+    prospectVille: z.string().optional(),
+  })
+  .refine(
+    (data) => {
+      // Si le type de recommandation est "prospect", alors au moins un des deux champs prénom/nom doit être rempli
+      if (data.typeRecommandation === "prospect") {
+        return !!data.prospectPrenom || !!data.prospectNom;
+      }
+      return true;
+    },
+    {
+      message: "Vous devez renseigner au moins le prénom ou le nom du prospect",
+      path: ["prospectPrenom"],
+    }
+  )
+  .refine(
+    (data) => {
+      // Si le statut est "rendezvous", alors dateRendezVous est obligatoire
+      if (data.status === "rendezvous") {
+        return !!data.dateRendezVous;
+      }
+      return true;
+    },
+    {
+      message: "La date de rendez-vous est obligatoire quand le statut est 'Rendez-vous'",
+      path: ["dateRendezVous"],
+    }
+  )
+  .refine(
+    (data) => {
+      // Si le statut est "installation", alors dateInstallation est obligatoire
+      if (data.status === "installation") {
+        return !!data.dateInstallation;
+      }
+      return true;
+    },
+    {
+      message: "La date d'installation est obligatoire quand le statut est 'Installation'",
+      path: ["dateInstallation"],
+    }
+  )
+  .refine(
+    (data) => {
+      // Si la source est "recommandation", le type de recommandation est obligatoire
+      if (data.source === "recommandation") {
+        return !!data.typeRecommandation;
+      }
+      return true;
+    },
+    {
+      message: "Le type de recommandation est obligatoire",
+      path: ["typeRecommandation"],
+    }
+  )
+  .refine(
+    (data) => {
+      // Si le type de recommandation est "client", alors clientRecommandation est obligatoire
+      if (data.source === "recommandation" && data.typeRecommandation === "client") {
+        return !!data.clientRecommandation;
+      }
+      return true;
+    },
+    {
+      message: "Vous devez sélectionner un client référent",
+      path: ["clientRecommandation"],
+    }
+  )
+  .refine(
+    (data) => {
+      // Si le type de recommandation est "prospect", alors prospectCivilite est obligatoire
+      if (data.source === "recommandation" && data.typeRecommandation === "prospect") {
+        return !!data.prospectCivilite;
+      }
+      return true;
+    },
+    {
+      message: "La civilité du prospect est obligatoire",
+      path: ["prospectCivilite"],
+    }
+  )
+  .refine(
+    (data) => {
+      // Si le type de recommandation est "prospect", alors prospectMobile est obligatoire
+      if (data.source === "recommandation" && data.typeRecommandation === "prospect") {
+        return !!data.prospectMobile;
+      }
+      return true;
+    },
+    {
+      message: "Le numéro de mobile du prospect est obligatoire",
+      path: ["prospectMobile"],
+    }
+  )
+  .refine(
+    (data) => {
+      // Si le type de recommandation est "prospect", alors prospectCodePostal est obligatoire
+      if (data.source === "recommandation" && data.typeRecommandation === "prospect") {
+        return !!data.prospectCodePostal;
+      }
+      return true;
+    },
+    {
+      message: "Le code postal du prospect est obligatoire",
+      path: ["prospectCodePostal"],
+    }
+  )
+  .refine(
+    (data) => {
+      // Si le type de recommandation est "prospect", alors prospectVille est obligatoire
+      if (data.source === "recommandation" && data.typeRecommandation === "prospect") {
+        return !!data.prospectVille;
+      }
+      return true;
+    },
+    {
+      message: "La ville du prospect est obligatoire",
+      path: ["prospectVille"],
+    }
+  );
+
+// Crée un type pour les valeurs du formulaire
+export type ClientFormValues = z.infer<typeof clientFormSchema>;
+
+type ClientFormProps = {
+  defaultValues?: Partial<ClientFormValues>;
+  onSubmit: (values: ClientFormValues) => void;
+  isSubmitting?: boolean;
+  isEdit?: boolean;
+};
+
+export function ClientFormNew({
+  defaultValues,
+  onSubmit,
+  isSubmitting = false,
+  isEdit = false,
+}: ClientFormProps) {
+  const [activeTab, setActiveTab] = useState("personnel");
+  const [selectedProduct, setSelectedProduct] = useState<string>("");
+  const [availableSimCards, setAvailableSimCards] = useState<{id: number, iccid: string}[]>([]);
+  // État pour suivre les champs du formulaire et leur progression
+  const [formProgressFields, setFormProgressFields] = useState<FormProgressField[]>([]);
+  // États pour l'affichage conditionnel des champs de source
+  const [selectedSource, setSelectedSource] = useState<string>("");
+  const [selectedTypeRecommandation, setSelectedTypeRecommandation] = useState<string>("");
+  const [availableClients, setAvailableClients] = useState<{id: number, nom: string, prenom: string}[]>([]);
+  
+  const { toast } = useToast();
+  const { getUserRole } = useRole();
+  const userRole = getUserRole();
+  const isAdmin = userRole === "admin";
+
+  // Charger les cartes SIM disponibles quand le produit est un forfait 5G
+  useEffect(() => {
+    if (selectedProduct === "forfait_5g") {
+      const fetchSimCards = async () => {
+        try {
+          const response = await fetch('/api/sim-cards/available');
+          if (!response.ok) {
+            throw new Error('Impossible de récupérer les cartes SIM disponibles');
+          }
+          const data = await response.json();
+          setAvailableSimCards(data);
+        } catch (error) {
+          console.error('Erreur lors du chargement des cartes SIM:', error);
+          toast({
+            title: "Erreur",
+            description: "Impossible de charger les cartes SIM disponibles",
+            variant: "destructive",
+          });
+        }
+      };
+      
+      fetchSimCards();
+    }
+  }, [selectedProduct, toast]);
+  
+  // Charger la liste des clients disponibles pour la recommandation
+  useEffect(() => {
+    if (selectedSource === "recommandation" && selectedTypeRecommandation === "client") {
+      const fetchClients = async () => {
+        try {
+          const response = await fetch('/api/clients');
+          if (!response.ok) {
+            throw new Error('Impossible de récupérer la liste des clients');
+          }
+          const data = await response.json();
+          // Mapper les données pour n'avoir que les informations nécessaires
+          const clients = data.map((client: any) => ({
+            id: client.id,
+            nom: client.nom || '',
+            prenom: client.prenom || ''
+          }));
+          setAvailableClients(clients);
+        } catch (error) {
+          console.error('Erreur lors du chargement des clients:', error);
+          toast({
+            title: "Erreur",
+            description: "Impossible de charger la liste des clients",
+            variant: "destructive",
+          });
+        }
+      };
+      
+      fetchClients();
+    }
+  }, [selectedSource, selectedTypeRecommandation, toast]);
+
+  // Formulaire avec validation Zod
+  const form = useForm<ClientFormValues>({
+    resolver: zodResolver(clientFormSchema),
+    defaultValues: {
+      civilite: "",
+      prenom: "",
+      nom: "",
+      email: "",
+      phone: "",
+      dateNaissance: "",
+      adresse: "",
+      codePostal: "",
+      ville: "",
+      status: "enregistre",
+      forfaitType: "",
+      dateSignature: "",
+      dateRendezVous: "",
+      dateInstallation: "",
+      commentaire: "",
+      codeVendeur: "",
+      portabilite: "",
+      carteSIM: "",
+      numeroPorter: "",
+      mandatSepa: false,
+      contratSigne: false,
+      bonCommande: false,
+      ribClient: false,
+      copiePieceIdentite: false,
+      attestationHonneur: false,
+      // Nouveaux champs pour la source
+      source: "",
+      typeRecommandation: "",
+      clientRecommandation: undefined,
+      // Champs pour le prospect de recommandation
+      prospectCivilite: "",
+      prospectPrenom: "",
+      prospectNom: "",
+      prospectMobile: "",
+      prospectCodePostal: "",
+      prospectVille: "",
+      ...defaultValues,
+    },
+  });
+
+  // État pour vérifier si la date de RDV ou d'installation est requise en fonction du statut
+  const [isDateRendezVousRequired, setIsDateRendezVousRequired] = useState(false);
+  const [isDateInstallationRequired, setIsDateInstallationRequired] = useState(false);
+
+  // Fonction pour formatter une date en français
+  const formatDate = (date: Date | string) => {
+    if (!date) return "";
+    const dateObj = typeof date === "string" ? new Date(date) : date;
+    return format(dateObj, "dd/MM/yyyy", { locale: fr });
+  };
+
+  // Observation du changement de statut pour déterminer si les champs de date sont requis
+  useEffect(() => {
+    const status = form.watch("status");
+    setIsDateRendezVousRequired(status === "rendezvous");
+    setIsDateInstallationRequired(status === "installation");
+  }, [form.watch("status")]);
+  
+  // Charger les clients disponibles quand le type de recommandation est "client"
+  useEffect(() => {
+    if (selectedSource === "recommandation" && selectedTypeRecommandation === "client") {
+      const fetchClients = async () => {
+        try {
+          const response = await fetch('/api/clients/personal');
+          if (!response.ok) {
+            throw new Error('Impossible de récupérer les clients disponibles');
+          }
+          const data = await response.json();
+          setAvailableClients(data);
+        } catch (error) {
+          console.error('Erreur lors du chargement des clients:', error);
+          toast({
+            title: "Erreur",
+            description: "Impossible de charger la liste des clients personnels",
+            variant: "destructive",
+          });
+        }
+      };
+      
+      fetchClients();
+    }
+  }, [selectedSource, selectedTypeRecommandation, toast]);
+  
+  // Observer les changements de valeurs pour la source et le type de recommandation
+  useEffect(() => {
+    const source = form.watch("source");
+    const typeRecommandation = form.watch("typeRecommandation");
+    
+    setSelectedSource(source || "");
+    setSelectedTypeRecommandation(typeRecommandation || "");
+  }, [form]);
+
+  // Initialiser les champs de suivi de progression du formulaire
+  useEffect(() => {
+    // Utiliser watchAll pour observer tous les changements de valeurs dans le formulaire
+    const formValues = form.getValues();
+    
+    const fields: FormProgressField[] = [
+      // Section Personnel
+      { id: "civilite", label: "Civilité", required: true, section: "personnel", validated: !!formValues.civilite },
+      { id: "prenom", label: "Prénom", required: true, section: "personnel", validated: !!formValues.prenom },
+      { id: "nom", label: "Nom", required: true, section: "personnel", validated: !!formValues.nom },
+      { id: "email", label: "Email", required: true, section: "personnel", validated: !!formValues.email },
+      { id: "phone", label: "Téléphone", required: false, section: "personnel", validated: !!formValues.phone },
+      { id: "dateNaissance", label: "Date de naissance", required: true, section: "personnel", validated: !!formValues.dateNaissance },
+      
+      // Section Adresse
+      { id: "adresse", label: "Adresse", required: false, section: "adresse", validated: !!formValues.adresse },
+      { id: "codePostal", label: "Code Postal", required: false, section: "adresse", validated: !!formValues.codePostal },
+      { id: "ville", label: "Ville", required: false, section: "adresse", validated: !!formValues.ville },
+      
+      // Section Contrat
+      { id: "forfaitType", label: "Produit", required: false, section: "contrat", validated: !!formValues.forfaitType },
+      { id: "dateSignature", label: "Date de signature", required: false, section: "contrat", validated: !!formValues.dateSignature },
+      { id: "status", label: "Statut", required: true, section: "contrat", validated: !!formValues.status },
+      { id: "dateRendezVous", label: "Date de rendez-vous", required: isDateRendezVousRequired, section: "contrat", validated: !isDateRendezVousRequired || !!formValues.dateRendezVous },
+      { id: "dateInstallation", label: "Date d'installation", required: isDateInstallationRequired, section: "contrat", validated: !isDateInstallationRequired || !!formValues.dateInstallation },
+      
+      // Section Source (remplace Documents)
+      { id: "source", label: "Source", required: true, section: "source", validated: !!formValues.source },
+      { id: "typeRecommandation", label: "Type de recommandation", required: selectedSource === "recommandation", section: "source", validated: selectedSource !== "recommandation" || !!formValues.typeRecommandation },
+      { id: "clientRecommandation", label: "Client recommandé", required: selectedSource === "recommandation" && selectedTypeRecommandation === "client", section: "source", validated: selectedSource !== "recommandation" || selectedTypeRecommandation !== "client" || !!formValues.clientRecommandation },
+      { id: "prospectCivilite", label: "Civilité prospect", required: selectedSource === "recommandation" && selectedTypeRecommandation === "prospect", section: "source", validated: selectedSource !== "recommandation" || selectedTypeRecommandation !== "prospect" || !!formValues.prospectCivilite },
+      { id: "prospectPrenom", label: "Prénom prospect", required: false, section: "source", validated: selectedSource !== "recommandation" || selectedTypeRecommandation !== "prospect" || !!formValues.prospectPrenom || !!formValues.prospectNom },
+      { id: "prospectNom", label: "Nom prospect", required: false, section: "source", validated: selectedSource !== "recommandation" || selectedTypeRecommandation !== "prospect" || !!formValues.prospectNom || !!formValues.prospectPrenom },
+      { id: "prospectMobile", label: "Mobile prospect", required: selectedSource === "recommandation" && selectedTypeRecommandation === "prospect", section: "source", validated: selectedSource !== "recommandation" || selectedTypeRecommandation !== "prospect" || !!formValues.prospectMobile },
+      { id: "prospectCodePostal", label: "Code postal prospect", required: selectedSource === "recommandation" && selectedTypeRecommandation === "prospect", section: "source", validated: selectedSource !== "recommandation" || selectedTypeRecommandation !== "prospect" || !!formValues.prospectCodePostal },
+      { id: "prospectVille", label: "Ville prospect", required: selectedSource === "recommandation" && selectedTypeRecommandation === "prospect", section: "source", validated: selectedSource !== "recommandation" || selectedTypeRecommandation !== "prospect" || !!formValues.prospectVille },
+      { id: "commentaire", label: "Commentaire", required: false, section: "source", validated: true },
+      
+      // Champs documents déplacés à la fin
+      { id: "mandatSepa", label: "Mandat SEPA", required: false, section: "source", validated: !!formValues.mandatSepa },
+      { id: "contratSigne", label: "Contrat signé", required: false, section: "source", validated: !!formValues.contratSigne },
+      { id: "bonCommande", label: "Bon de commande", required: false, section: "source", validated: !!formValues.bonCommande },
+      { id: "ribClient", label: "RIB client", required: false, section: "source", validated: !!formValues.ribClient },
+      { id: "copiePieceIdentite", label: "Copie pièce d'identité", required: false, section: "source", validated: !!formValues.copiePieceIdentite },
+    ];
+    
+    setFormProgressFields(fields);
+  }, [
+    form, 
+    isDateRendezVousRequired, 
+    isDateInstallationRequired,
+    // Utiliser watchAll au lieu de watch sur des champs individuels
+    form.watch()
+  ]);
+
+  // Gestion des soumissions
+  const handleSubmit = (values: ClientFormValues) => {
+    // Vérification des champs obligatoires en fonction du statut
+    if (values.status === "rendezvous" && !values.dateRendezVous) {
+      toast({
+        title: "Date de rendez-vous requise",
+        description: "Pour le statut Rendez-vous, veuillez définir une date de rendez-vous",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    if (values.status === "installation" && !values.dateInstallation) {
+      toast({
+        title: "Date d'installation requise",
+        description: "Pour le statut Installation, veuillez définir une date d'installation",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    onSubmit(values);
+  };
+
+  return (
+    <div className="space-y-6">
+      <Form {...form}>
+        <form onSubmit={form.handleSubmit(handleSubmit)}>
+          {/* Indicateur de progression du formulaire */}
+          <FormProgressGamified 
+            fields={formProgressFields}
+            activeSection={activeTab}
+            onSectionComplete={(section) => {
+              // Optionnel: basculer automatiquement vers la section suivante 
+              // lorsqu'une section est complétée
+              if (section === "personnel") setActiveTab("adresse");
+              else if (section === "adresse") setActiveTab("contrat");
+              else if (section === "contrat") setActiveTab("documents");
+            }}
+          />
+          
+          <Tabs 
+            value={activeTab} 
+            onValueChange={setActiveTab}
+            className="w-full"
+          >
+            {/* Navigation par onglets */}
+            <TabsList className="grid grid-cols-4 mb-6">
+              <TabsTrigger value="personnel" className="text-xs sm:text-sm">Personnel</TabsTrigger>
+              <TabsTrigger value="adresse" className="text-xs sm:text-sm">Adresse</TabsTrigger>
+              <TabsTrigger value="contrat" className="text-xs sm:text-sm">Contrat</TabsTrigger>
+              <TabsTrigger value="source" className="text-xs sm:text-sm">Source</TabsTrigger>
+            </TabsList>
+
+            {/* Onglet Informations personnelles */}
+            <TabsContent value="personnel" className="space-y-4">
+              <Card>
+                <CardContent className="pt-6 space-y-4">
+                  <FormField
+                    control={form.control}
+                    name="civilite"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel className="after:content-['*'] after:ml-0.5 after:text-red-500">Civilité</FormLabel>
+                        <Select 
+                          onValueChange={field.onChange} 
+                          defaultValue={field.value}
+                        >
+                          <FormControl>
+                            <SelectTrigger>
+                              <SelectValue placeholder="Sélectionnez une civilité" />
+                            </SelectTrigger>
+                          </FormControl>
+                          <SelectContent>
+                            <SelectItem value="M">Monsieur</SelectItem>
+                            <SelectItem value="Mme">Madame</SelectItem>
+                            <SelectItem value="Autre">Autre</SelectItem>
+                          </SelectContent>
+                        </Select>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+
+                  <FormField
+                    control={form.control}
+                    name="prenom"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel className="after:content-['*'] after:ml-0.5 after:text-red-500">Prénom</FormLabel>
+                        <FormControl>
+                          <Input placeholder="Prénom" {...field} />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+
+                  <FormField
+                    control={form.control}
+                    name="nom"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel className="after:content-['*'] after:ml-0.5 after:text-red-500">Nom</FormLabel>
+                        <FormControl>
+                          <Input placeholder="Nom" {...field} />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+
+                  <FormField
+                    control={form.control}
+                    name="email"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel className="after:content-['*'] after:ml-0.5 after:text-red-500">E-mail</FormLabel>
+                        <FormControl>
+                          <Input type="email" placeholder="email@exemple.com" {...field} />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+
+                  <FormField
+                    control={form.control}
+                    name="phone"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Téléphone</FormLabel>
+                        <FormControl>
+                          <Input type="tel" placeholder="Téléphone" {...field} />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+
+                  <FormField
+                    control={form.control}
+                    name="dateNaissance"
+                    render={({ field }) => (
+                      <FormItem className="flex flex-col">
+                        <FormLabel className="after:content-['*'] after:ml-0.5 after:text-red-500">
+                          Date de naissance
+                        </FormLabel>
+                        <FormControl>
+                          <DateInputFormatter 
+                            placeholder="JJ/MM/AAAA" 
+                            value={field.value}
+                            onChange={field.onChange}
+                          />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+
+                  <div className="flex justify-end mt-4">
+                    <Button 
+                      type="button" 
+                      onClick={() => setActiveTab("adresse")}
+                      variant="outline"
+                      className="ml-auto"
+                    >
+                      Suivant
+                    </Button>
+                  </div>
+                </CardContent>
+              </Card>
+            </TabsContent>
+
+            {/* Onglet Adresse */}
+            <TabsContent value="adresse" className="space-y-4">
+              <Card>
+                <CardContent className="pt-6 space-y-4">
+                  <FormField
+                    control={form.control}
+                    name="adresse"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Adresse</FormLabel>
+                        <FormControl>
+                          <Input placeholder="Adresse" {...field} />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+
+                  <FormField
+                    control={form.control}
+                    name="codePostal"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Code postal</FormLabel>
+                        <FormControl>
+                          <PostalCodeAutocomplete 
+                            placeholder="Code postal" 
+                            value={field.value || ""}
+                            onChange={field.onChange}
+                            onCitySelect={(city) => {
+                              // Mettre à jour automatiquement le champ ville
+                              form.setValue("ville", city);
+                            }}
+                          />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+
+                  <FormField
+                    control={form.control}
+                    name="ville"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Ville</FormLabel>
+                        <FormControl>
+                          <Input placeholder="Ville" {...field} />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+
+                  <div className="flex justify-between mt-4">
+                    <Button 
+                      type="button" 
+                      onClick={() => setActiveTab("personnel")}
+                      variant="outline"
+                    >
+                      Précédent
+                    </Button>
+                    <Button 
+                      type="button" 
+                      onClick={() => setActiveTab("contrat")}
+                      variant="outline"
+                    >
+                      Suivant
+                    </Button>
+                  </div>
+                </CardContent>
+              </Card>
+            </TabsContent>
+
+            {/* Onglet Contrat */}
+            <TabsContent value="contrat" className="space-y-4">
+              <Card>
+                <CardContent className="pt-6 space-y-4">
+                  {/* Date signature placée en premier */}
+                  <FormField
+                    control={form.control}
+                    name="dateSignature"
+                    render={({ field }) => (
+                      <FormItem className="flex flex-col">
+                        <FormLabel>Date de signature</FormLabel>
+                        <FormControl>
+                          <DateInputFormatter 
+                            placeholder="JJ/MM/AAAA"
+                            value={field.value || ""}
+                            onChange={field.onChange}
+                          />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+
+                  <FormField
+                    control={form.control}
+                    name="forfaitType"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Produit</FormLabel>
+                        <Select 
+                          onValueChange={(value) => {
+                            // Mise à jour du champ et de l'état sans console.log
+                            field.onChange(value);
+                            setSelectedProduct(value);
+                          }} 
+                          defaultValue={field.value}
+                        >
+                          <FormControl>
+                            <SelectTrigger>
+                              <SelectValue placeholder="Sélectionner un produit" />
+                            </SelectTrigger>
+                          </FormControl>
+                          <SelectContent>
+                            <SelectItem value="freebox_pop">Freebox Pop</SelectItem>
+                            <SelectItem value="freebox_essentiel">Freebox Essentiel</SelectItem>
+                            <SelectItem value="freebox_ultra">Freebox Ultra</SelectItem>
+                            <SelectItem value="forfait_5g">Forfait 5G</SelectItem>
+                          </SelectContent>
+                        </Select>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                  
+                  {/* Champs conditionnels pour le forfait 5G */}
+                  {/* Suppression du console.log qui peut causer une erreur ReactNode */}
+                  
+                  <div className={selectedProduct === "forfait_5g" ? "block" : "hidden"}>
+                    <FormField
+                      control={form.control}
+                      name="portabilite"
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>Portabilité</FormLabel>
+                          <Select 
+                            onValueChange={field.onChange} 
+                            defaultValue={field.value}
+                          >
+                            <FormControl>
+                              <SelectTrigger>
+                                <SelectValue placeholder="Merci de préciser" />
+                              </SelectTrigger>
+                            </FormControl>
+                            <SelectContent>
+                              <SelectItem value="portabilite">Portabilité</SelectItem>
+                              <SelectItem value="creation">Création</SelectItem>
+                            </SelectContent>
+                          </Select>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                    
+                    <FormField
+                      control={form.control}
+                      name="carteSIM"
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>Carte SIM</FormLabel>
+                          <Select 
+                            onValueChange={field.onChange} 
+                            defaultValue={field.value}
+                          >
+                            <FormControl>
+                              <SelectTrigger>
+                                <SelectValue placeholder="Sélectionner une carte SIM" />
+                              </SelectTrigger>
+                            </FormControl>
+                            <SelectContent>
+                              {availableSimCards.length === 0 ? (
+                                <SelectItem value="no_sim" disabled>Aucune carte SIM disponible</SelectItem>
+                              ) : (
+                                availableSimCards.map(card => (
+                                  <SelectItem key={card.id} value={card.iccid}>
+                                    {card.iccid}
+                                  </SelectItem>
+                                ))
+                              )}
+                            </SelectContent>
+                          </Select>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                  </div>
+
+                  <FormField
+                    control={form.control}
+                    name="status"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel className="after:content-['*'] after:ml-0.5 after:text-red-500">Statut</FormLabel>
+                        <FormControl>
+                          <ClientStatusSelector
+                            value={field.value}
+                            onValueChange={(value) => {
+                              // Avant de changer la valeur, vérifier si on passe au statut rendez-vous ou installation
+                              if (value === "rendezvous") {
+                                form.setValue("dateRendezVous", "");
+                                form.clearErrors("dateRendezVous");
+                                setIsDateRendezVousRequired(true);
+                              } else if (value === "installation") {
+                                form.setValue("dateInstallation", "");
+                                form.clearErrors("dateInstallation");
+                                setIsDateInstallationRequired(true);
+                              } else {
+                                setIsDateRendezVousRequired(false);
+                                setIsDateInstallationRequired(false);
+                              }
+                              
+                              field.onChange(value);
+                              
+                              // Forcer le rendu
+                              setTimeout(() => {
+                                setActiveTab(activeTab);
+                              }, 10);
+                            }}
+                          />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+
+                  {/* Date rendez-vous conditionnelle */}
+                  {form.getValues("status") === "rendezvous" && (
+                    <FormField
+                      control={form.control}
+                      name="dateRendezVous"
+                      render={({ field }) => (
+                        <FormItem className="flex flex-col">
+                          <FormLabel className="after:content-['*'] after:ml-0.5 after:text-red-500">
+                            Date de rendez-vous
+                          </FormLabel>
+                          <FormControl>
+                            <DateInputFormatter 
+                              placeholder="JJ/MM/AAAA"
+                              value={field.value || ""}
+                              onChange={(value) => {
+                                field.onChange(value);
+                                if (value) {
+                                  form.clearErrors("dateRendezVous");
+                                }
+                              }}
+                            />
+                          </FormControl>
+                          <FormMessage>
+                            Ce champ est obligatoire pour le statut "Rendez-vous"
+                          </FormMessage>
+                        </FormItem>
+                      )}
+                    />
+                  )}
+
+                  {/* Date installation conditionnelle */}
+                  {form.getValues("status") === "installation" && (
+                    <FormField
+                      control={form.control}
+                      name="dateInstallation"
+                      render={({ field }) => (
+                        <FormItem className="flex flex-col">
+                          <FormLabel className="after:content-['*'] after:ml-0.5 after:text-red-500">
+                            Date d'installation
+                          </FormLabel>
+                          <FormControl>
+                            <DateInputFormatter 
+                              placeholder="JJ/MM/AAAA"
+                              value={field.value || ""}
+                              onChange={(value) => {
+                                field.onChange(value);
+                                if (value) {
+                                  form.clearErrors("dateInstallation");
+                                }
+                              }}
+                            />
+                          </FormControl>
+                          <FormMessage>
+                            Ce champ est obligatoire pour le statut "Installation"
+                          </FormMessage>
+                        </FormItem>
+                      )}
+                    />
+                  )}
+
+                  <FormField
+                    control={form.control}
+                    name="codeVendeur"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Code vendeur</FormLabel>
+                        <FormControl>
+                          <Input placeholder="Code vendeur" {...field} />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+
+                  <div className="flex justify-between mt-4">
+                    <Button 
+                      type="button" 
+                      onClick={() => setActiveTab("adresse")}
+                      variant="outline"
+                    >
+                      Précédent
+                    </Button>
+                    <Button 
+                      type="button" 
+                      onClick={() => setActiveTab("source")}
+                      variant="outline"
+                    >
+                      Suivant
+                    </Button>
+                  </div>
+                </CardContent>
+              </Card>
+            </TabsContent>
+
+            {/* Onglet Documents - maintenu pour compatibilité mais sans contenu visible */}
+            <TabsContent value="documents" className="hidden">
+              <Card>
+                <CardContent className="pt-6 space-y-4">
+                  {/* Contenu vide pour compatibilité */}
+                </CardContent>
+              </Card>
+            </TabsContent>
+            
+            {/* Onglet Source (remplace Documents) */}
+            <TabsContent value="source" className="space-y-4">
+              <Card>
+                <CardContent className="pt-6 space-y-4">
+                  <h3 className="text-lg font-medium mb-2">Informations sur la source</h3>
+                  
+                  <FormField
+                    control={form.control}
+                    name="source"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel className="after:content-['*'] after:ml-0.5 after:text-red-500">Source</FormLabel>
+                        <Select 
+                          onValueChange={(value) => {
+                            field.onChange(value);
+                            // Réinitialiser les champs liés à la recommandation si la source change
+                            if (value !== "recommandation") {
+                              form.setValue("typeRecommandation", "");
+                              form.setValue("clientRecommandation", undefined);
+                              form.setValue("prospectCivilite", "");
+                              form.setValue("prospectPrenom", "");
+                              form.setValue("prospectNom", "");
+                              form.setValue("prospectMobile", "");
+                              form.setValue("prospectCodePostal", "");
+                              form.setValue("prospectVille", "");
+                            }
+                          }} 
+                          defaultValue={field.value}
+                        >
+                          <FormControl>
+                            <SelectTrigger>
+                              <SelectValue placeholder="Sélectionner la source" />
+                            </SelectTrigger>
+                          </FormControl>
+                          <SelectContent>
+                            <SelectItem value="prospection_direct">Prospection direct</SelectItem>
+                            <SelectItem value="flyer">Flyer</SelectItem>
+                            <SelectItem value="recommandation">Recommandation</SelectItem>
+                            <SelectItem value="stand_salon">Stand & Salons</SelectItem>
+                            <SelectItem value="reseaux_sociaux">Réseaux sociaux</SelectItem>
+                            <SelectItem value="site_web">Site Web</SelectItem>
+                            <SelectItem value="autocollant">Autocollant</SelectItem>
+                            <SelectItem value="autre">Autre</SelectItem>
+                          </SelectContent>
+                        </Select>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                  
+                  {/* Champs conditionnels pour la source "Recommandation" */}
+                  {selectedSource === "recommandation" && (
+                    <div className="space-y-4 border-l-2 border-primary/20 pl-4 py-2">
+                      <FormField
+                        control={form.control}
+                        name="typeRecommandation"
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel className="after:content-['*'] after:ml-0.5 after:text-red-500">Type de recommandation</FormLabel>
+                            <Select 
+                              onValueChange={(value) => {
+                                field.onChange(value);
+                                // Réinitialiser les champs spécifiques au type
+                                if (value === "client") {
+                                  form.setValue("prospectCivilite", "");
+                                  form.setValue("prospectPrenom", "");
+                                  form.setValue("prospectNom", "");
+                                  form.setValue("prospectMobile", "");
+                                  form.setValue("prospectCodePostal", "");
+                                  form.setValue("prospectVille", "");
+                                } else if (value === "prospect") {
+                                  form.setValue("clientRecommandation", undefined);
+                                }
+                              }} 
+                              defaultValue={field.value}
+                            >
+                              <FormControl>
+                                <SelectTrigger>
+                                  <SelectValue placeholder="Sélectionner le type" />
+                                </SelectTrigger>
+                              </FormControl>
+                              <SelectContent>
+                                <SelectItem value="client">Client</SelectItem>
+                                <SelectItem value="prospect">Prospect</SelectItem>
+                              </SelectContent>
+                            </Select>
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+                      
+                      {/* Si type = client, afficher la liste des clients */}
+                      {selectedTypeRecommandation === "client" && (
+                        <FormField
+                          control={form.control}
+                          name="clientRecommandation"
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel className="after:content-['*'] after:ml-0.5 after:text-red-500">Client référent</FormLabel>
+                              <Select 
+                                onValueChange={(value) => field.onChange(parseInt(value))} 
+                                defaultValue={field.value ? field.value.toString() : ""}
+                              >
+                                <FormControl>
+                                  <SelectTrigger>
+                                    <SelectValue placeholder="Sélectionner un client" />
+                                  </SelectTrigger>
+                                </FormControl>
+                                <SelectContent>
+                                  {availableClients.length > 0 ? (
+                                    availableClients.map((client) => (
+                                      <SelectItem key={client.id} value={client.id.toString()}>
+                                        {client.prenom} {client.nom}
+                                      </SelectItem>
+                                    ))
+                                  ) : (
+                                    <SelectItem value="no_clients" disabled>
+                                      Aucun client disponible
+                                    </SelectItem>
+                                  )}
+                                </SelectContent>
+                              </Select>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                      )}
+                      
+                      {/* Si type = prospect, afficher le mini-formulaire */}
+                      {selectedTypeRecommandation === "prospect" && (
+                        <div className="space-y-4 border-l-2 border-muted p-3">
+                          <h4 className="text-sm font-medium">Informations sur le prospect référent</h4>
+                          
+                          <FormField
+                            control={form.control}
+                            name="prospectCivilite"
+                            render={({ field }) => (
+                              <FormItem>
+                                <FormLabel className="after:content-['*'] after:ml-0.5 after:text-red-500">Civilité</FormLabel>
+                                <Select 
+                                  onValueChange={field.onChange} 
+                                  defaultValue={field.value}
+                                >
+                                  <FormControl>
+                                    <SelectTrigger>
+                                      <SelectValue placeholder="Sélectionnez une civilité" />
+                                    </SelectTrigger>
+                                  </FormControl>
+                                  <SelectContent>
+                                    <SelectItem value="M">Monsieur</SelectItem>
+                                    <SelectItem value="Mme">Madame</SelectItem>
+                                    <SelectItem value="Autre">Autre</SelectItem>
+                                  </SelectContent>
+                                </Select>
+                                <FormMessage />
+                              </FormItem>
+                            )}
+                          />
+                          
+                          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <FormField
+                              control={form.control}
+                              name="prospectPrenom"
+                              render={({ field }) => (
+                                <FormItem>
+                                  <FormLabel>Prénom</FormLabel>
+                                  <FormControl>
+                                    <Input placeholder="Prénom" {...field} />
+                                  </FormControl>
+                                  <FormMessage />
+                                </FormItem>
+                              )}
+                            />
+                            
+                            <FormField
+                              control={form.control}
+                              name="prospectNom"
+                              render={({ field }) => (
+                                <FormItem>
+                                  <FormLabel>Nom</FormLabel>
+                                  <FormControl>
+                                    <Input placeholder="Nom" {...field} />
+                                  </FormControl>
+                                  <FormMessage />
+                                </FormItem>
+                              )}
+                            />
+                          </div>
+                          
+                          <FormField
+                            control={form.control}
+                            name="prospectMobile"
+                            render={({ field }) => (
+                              <FormItem>
+                                <FormLabel className="after:content-['*'] after:ml-0.5 after:text-red-500">Mobile</FormLabel>
+                                <FormControl>
+                                  <Input type="tel" placeholder="Téléphone mobile" {...field} />
+                                </FormControl>
+                                <FormMessage />
+                              </FormItem>
+                            )}
+                          />
+                          
+                          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <FormField
+                              control={form.control}
+                              name="prospectCodePostal"
+                              render={({ field }) => (
+                                <FormItem>
+                                  <FormLabel className="after:content-['*'] after:ml-0.5 after:text-red-500">Code Postal</FormLabel>
+                                  <FormControl>
+                                    <Input placeholder="75123" {...field} />
+                                  </FormControl>
+                                  <FormMessage />
+                                </FormItem>
+                              )}
+                            />
+                            
+                            <FormField
+                              control={form.control}
+                              name="prospectVille"
+                              render={({ field }) => (
+                                <FormItem>
+                                  <FormLabel className="after:content-['*'] after:ml-0.5 after:text-red-500">Ville</FormLabel>
+                                  <FormControl>
+                                    <Input placeholder="Ville" {...field} />
+                                  </FormControl>
+                                  <FormMessage />
+                                </FormItem>
+                              )}
+                            />
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  
+                  <FormField
+                    control={form.control}
+                    name="commentaire"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Commentaire</FormLabel>
+                        <FormControl>
+                          <Textarea 
+                            placeholder="Notez les tâches à effectuer pour le client." 
+                            className="min-h-[100px]"
+                            {...field} 
+                          />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                  
+                  {/* Documents contractuels */}
+                  <div className="mt-6">
+                    <h3 className="text-lg font-medium mb-2">Documents contractuels</h3>
+                    <div className="space-y-3">
+                      <FormField
+                        control={form.control}
+                        name="attestationHonneur"
+                        render={({ field }) => (
+                          <FormItem className="flex flex-row items-center justify-between rounded-lg border p-3">
+                            <div className="space-y-0.5">
+                              <FormLabel>Attestation sur l'honneur</FormLabel>
+                            </div>
+                            <FormControl>
+                              <Switch
+                                checked={field.value}
+                                onCheckedChange={field.onChange}
+                              />
+                            </FormControl>
+                          </FormItem>
+                        )}
+                      />
+                      
+                      <FormField
+                        control={form.control}
+                        name="mandatSepa"
+                        render={({ field }) => (
+                          <FormItem className="flex flex-row items-center justify-between rounded-lg border p-3">
+                            <div className="space-y-0.5">
+                              <FormLabel>Mandat SEPA</FormLabel>
+                            </div>
+                            <FormControl>
+                              <Switch
+                                checked={field.value}
+                                onCheckedChange={field.onChange}
+                              />
+                            </FormControl>
+                          </FormItem>
+                        )}
+                      />
+                      
+                      <FormField
+                        control={form.control}
+                        name="contratSigne"
+                        render={({ field }) => (
+                          <FormItem className="flex flex-row items-center justify-between rounded-lg border p-3">
+                            <div className="space-y-0.5">
+                              <FormLabel>Contrat signé</FormLabel>
+                            </div>
+                            <FormControl>
+                              <Switch
+                                checked={field.value}
+                                onCheckedChange={field.onChange}
+                              />
+                            </FormControl>
+                          </FormItem>
+                        )}
+                      />
+                      
+                      <FormField
+                        control={form.control}
+                        name="bonCommande"
+                        render={({ field }) => (
+                          <FormItem className="flex flex-row items-center justify-between rounded-lg border p-3">
+                            <div className="space-y-0.5">
+                              <FormLabel>Bon de commande</FormLabel>
+                            </div>
+                            <FormControl>
+                              <Switch
+                                checked={field.value}
+                                onCheckedChange={field.onChange}
+                              />
+                            </FormControl>
+                          </FormItem>
+                        )}
+                      />
+                      
+                      <FormField
+                        control={form.control}
+                        name="ribClient"
+                        render={({ field }) => (
+                          <FormItem className="flex flex-row items-center justify-between rounded-lg border p-3">
+                            <div className="space-y-0.5">
+                              <FormLabel>RIB client</FormLabel>
+                            </div>
+                            <FormControl>
+                              <Switch
+                                checked={field.value}
+                                onCheckedChange={field.onChange}
+                              />
+                            </FormControl>
+                          </FormItem>
+                        )}
+                      />
+                      
+                      <FormField
+                        control={form.control}
+                        name="copiePieceIdentite"
+                        render={({ field }) => (
+                          <FormItem className="flex flex-row items-center justify-between rounded-lg border p-3">
+                            <div className="space-y-0.5">
+                              <FormLabel>Copie pièce d'identité</FormLabel>
+                            </div>
+                            <FormControl>
+                              <Switch
+                                checked={field.value}
+                                onCheckedChange={field.onChange}
+                              />
+                            </FormControl>
+                          </FormItem>
+                        )}
+                      />
+                    </div>
+                  </div>
+                  
+                  <div className="flex justify-between mt-6">
+                    <Button 
+                      type="button" 
+                      onClick={() => setActiveTab("contrat")}
+                      variant="outline"
+                    >
+                      Précédent
+                    </Button>
+                    <Button 
+                      type="submit" 
+                      disabled={isSubmitting}
+                      className="bg-green-600 hover:bg-green-700"
+                    >
+                      {isSubmitting ? (
+                        "Enregistrement en cours..."
+                      ) : (
+                        isEdit ? "Modifier le client" : "Ajouter le client"
+                      )}
+                    </Button>
+                  </div>
+                </CardContent>
+              </Card>
+            </TabsContent>
+          </Tabs>
+        </form>
+      </Form>
+    </div>
+  );
+}

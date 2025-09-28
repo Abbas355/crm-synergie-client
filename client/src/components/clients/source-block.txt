@@ -1,0 +1,71 @@
+                  {/* Source */}
+                  <FormField
+                    control={form.control}
+                    name="source"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel className="text-gray-700 font-medium">Source <span className="text-red-500">*</span></FormLabel>
+                        {isProduction ? (
+                          <FormControl>
+                            <SimpleSelect
+                              options={sourceOptions}
+                              value={field.value || ""}
+                              onChange={(value) => {
+                                field.onChange(value);
+                                // Réinitialiser les champs de recommandation si nécessaire
+                                if (value !== "Recommandation") {
+                                  // Utiliser batch pour optimiser les performances
+                                  setTimeout(() => {
+                                    form.setValue("typeRecommandation", "");
+                                    form.setValue("civiliteProspect", "");
+                                    form.setValue("prenomProspect", "");
+                                    form.setValue("nomProspect", "");
+                                    form.setValue("mobileProspect", "");
+                                    form.setValue("codePostalProspect", "");
+                                    form.setValue("villeProspect", "");
+                                  }, 50);
+                                }
+                              }}
+                              placeholder="Sélectionner une source"
+                              disabled={client && !editMode}
+                            />
+                          </FormControl>
+                        ) : (
+                          <Select
+                            onValueChange={(value) => {
+                              field.onChange(value);
+                              // Réinitialiser les champs de recommandation si nécessaire
+                              if (value !== "Recommandation") {
+                                setTimeout(() => {
+                                  form.setValue("typeRecommandation", "");
+                                  form.setValue("civiliteProspect", "");
+                                  form.setValue("prenomProspect", "");
+                                  form.setValue("nomProspect", "");
+                                  form.setValue("mobileProspect", "");
+                                  form.setValue("codePostalProspect", "");
+                                  form.setValue("villeProspect", "");
+                                }, 50);
+                              }
+                            }}
+                            value={field.value || ""}
+                            defaultValue={field.value || ""}
+                            disabled={client && !editMode}
+                          >
+                            <FormControl>
+                              <SelectTrigger className="bg-white border-gray-200 h-10">
+                                <SelectValue placeholder="Sélectionner une source" />
+                              </SelectTrigger>
+                            </FormControl>
+                            <SelectContent>
+                              {sourceOptions.map((option) => (
+                                <SelectItem key={option.value} value={option.value}>
+                                  {option.label}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        )}
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />

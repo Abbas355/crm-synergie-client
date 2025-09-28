@@ -1,0 +1,1099 @@
+import { useState, useEffect, useRef } from "react";
+import { z } from "zod";
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import { apiRequest, queryClient } from "@/lib/queryClient";
+import { Client } from "@shared/schema";
+import { useToast } from "@/hooks/use-toast";
+import { getCommunesByCodePostal } from "@/lib/api-communes";
+import { CommuneInput } from "@/components/ui/commune-input";
+import { StatusBadge } from "@/components/ui/status-badge";
+import { ClientFormContratTab } from "./client-form-contrat-tab-mobile";
+
+import {
+  Dialog,
+  DialogContent,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Button } from "@/components/ui/button";
+import {
+  Form,
+  FormControl,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+  FormDescription,
+} from "@/components/ui/form";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
+} from "@/components/ui/tabs";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
+import { 
+  User,
+  Mail, 
+  Phone, 
+  Calendar,
+  ChevronLeft,
+  X,
+  Loader2,
+  MapPin,
+  FileText,
+  Info,
+  Check,
+  Home,
+  Search,
+  Pencil,
+  FileSignature
+} from "lucide-react";
+
+// Options disponibles pour les listes déroulantes
+const civiliteOptions = [
+  { value: "m", label: "Monsieur" },
+  { value: "mme", label: "Madame" },
+  { value: "mlle", label: "Mademoiselle" }
+];
+
+const produitOptions = [
+  { value: "freebox_pop", label: "Freebox Pop" },
+  { value: "freebox_revolution", label: "Freebox Révolution" },
+  { value: "freebox_mini", label: "Freebox mini 4K" },
+  { value: "freebox_delta", label: "Freebox Delta" },
+  { value: "forfait_5g", label: "Forfait 5G" },
+  { value: "forfait_4g", label: "Forfait 4G" },
+  { value: "forfait_serie", label: "Forfait Série Spéciale" },
+];
+
+const portabiliteOptions = [
+  { value: "portabilite", label: "Portabilité" },
+  { value: "nouveau_numero", label: "Nouveau numéro" },
+];
+
+const sourceOptions = [
+  { value: "site_web", label: "Site web" },
+  { value: "telephone", label: "Téléphone" },
+  { value: "magasin", label: "Magasin" },
+  { value: "recommandation", label: "Recommandation" },
+  { value: "salon", label: "Salon / Événement" },
+  { value: "partenaire", label: "Partenaire" },
+];
+
+const typeRecommandationOptions = [
+  { value: "client", label: "Client existant" },
+  { value: "prospect", label: "Prospect" },
+];
+
+const clientFormSchema = z.object({
+  // Onglet Personnel
+  civilite: z.string().min(1, { message: "La civilité est requise" }),
+  prenom: z.string().min(1, { message: "Le prénom est requis" }),
+  nom: z.string().min(1, { message: "Le nom est requis" }),
+  dateNaissance: z.string()
+    .min(1, { message: "La date de naissance est requise" })
+    .refine((val) => {
+      // Vérifier le format jj/mm/aaaa
+      return /^\d{2}\/\d{2}\/\d{4}$/.test(val);
+    }, { message: "Format incorrect. Utilisez jj/mm/aaaa" })
+    .refine((val) => {
+      // Vérifier que le client a au moins 18 ans
+      const [day, month, year] = val.split('/').map(Number);
+      const birthDate = new Date(year, month - 1, day);
+      const today = new Date();
+      const age = today.getFullYear() - birthDate.getFullYear();
+      const monthDiff = today.getMonth() - birthDate.getMonth();
+      if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < birthDate.getDate())) {
+        return age - 1 >= 18;
+      }
+      return age >= 18;
+    }, { message: "Le client doit avoir au moins 18 ans" }),
+  email: z.string().email({ message: "Email invalide" }).min(1, { message: "L'email est requis" }),
+  mobile: z.string().min(1, { message: "Le numéro de mobile est requis" }),
+  fixe: z.string().optional().or(z.literal("")),
+  
+  // Onglet Adresse
+  adresse: z.string().min(1, { message: "L'adresse est requise" }),
+  codePostal: z.string().min(1, { message: "Le code postal est requis" }),
+  ville: z.string().min(1, { message: "La ville est requise" }),
+  
+  // Onglet Contrat
+  produit: z.string().min(1, { message: "Le produit est requis" }),
+  identifiantContrat: z.string().min(1, { message: "L'identifiant du contrat est requis" }),
+  carteSim: z.string().optional(),
+  portabilite: z.string().optional(),
+  numeroPorter: z.string().optional(),
+  
+  // Onglet Source
+  source: z.string().min(1, { message: "La source est requise" }),
+  typeRecommandation: z.string().optional(),
+  clientRecommandation: z.string().optional(),
+  
+  // Recommandation - Prospect
+  civiliteProspect: z.string().optional(),
+  prenomProspect: z.string().optional(),
+  nomProspect: z.string().optional(),
+  mobileProspect: z.string().optional(),
+  codePostalProspect: z.string().optional(),
+  villeProspect: z.string().optional(),
+  
+  // Commentaire
+  commentaire: z.string().optional().or(z.literal("")),
+  
+  // Date de signature
+  dateSignature: z.string().min(1, { message: "La date de signature est requise" }),
+})
+.refine((data) => {
+  // Si le type est prospect, au moins un des deux champs prénom ou nom prospect doit être rempli
+  if (data.typeRecommandation === 'prospect') {
+    return !!data.prenomProspect || !!data.nomProspect;
+  }
+  return true;
+}, {
+  message: "Vous devez saisir au moins le prénom ou le nom du prospect",
+  path: ["prenomProspect"]
+})
+.refine((data) => {
+  // Validation pour l'identifiant contrat selon le produit choisi
+  if (data.produit === 'freebox_pop' || data.produit === 'freebox_essentiel' || data.produit === 'freebox_ultra') {
+    return /^FO\d{8}$/.test(data.identifiantContrat);
+  } else if (data.produit === 'forfait_5g') {
+    return /^\d{8}$/.test(data.identifiantContrat);
+  }
+  return true;
+}, {
+  message: "Format d'identifiant incorrect pour ce produit",
+  path: ["identifiantContrat"]
+})
+.refine((data) => {
+  // Si portabilité = "portabilite", le numéro à porter est requis
+  if (data.portabilite === 'portabilite') {
+    return !!data.numeroPorter;
+  }
+  return true;
+}, {
+  message: "Le numéro à porter est requis pour une portabilité",
+  path: ["numeroPorter"]
+});
+
+type FormValues = z.infer<typeof clientFormSchema>;
+
+type ClientFormProps = {
+  isOpen: boolean;
+  onClose: () => void;
+  client?: Client; // Optional for edit mode
+};
+
+export function ClientForm({ isOpen, onClose, client }: ClientFormProps) {
+  const { toast } = useToast();
+  const [activeTab, setActiveTab] = useState("personnel");
+  const isEditMode = !!client;
+  const [editMode, setEditMode] = useState(false);
+  
+  // Référence pour le formulaire mobile vs desktop
+  const isMobile = useRef(window.innerWidth < 768);
+  
+  // Détection du changement de taille d'écran
+  useEffect(() => {
+    const handleResize = () => {
+      const mobile = window.innerWidth < 768;
+      if (isMobile.current !== mobile) {
+        isMobile.current = mobile;
+        // Forcer une mise à jour du composant
+        setActiveTab(activeTab);
+      }
+    };
+    
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, [activeTab]);
+
+  const form = useForm<FormValues>({
+    resolver: zodResolver(clientFormSchema),
+    defaultValues: {
+      // Onglet Personnel
+      civilite: client?.civilite || "",
+      prenom: client?.prenom || "",
+      nom: client?.nom || "",
+      dateNaissance: client?.dateNaissance || "",
+      email: client?.email || "",
+      mobile: client?.mobile || "",
+      fixe: client?.fixe || "",
+      
+      // Onglet Adresse
+      adresse: client?.adresse || "",
+      codePostal: client?.codePostal || "",
+      ville: client?.ville || "",
+      
+      // Onglet Contrat
+      produit: client?.produit || "",
+      identifiantContrat: client?.identifiantContrat || "",
+      carteSim: client?.carteSim || "",
+      portabilite: client?.portabilite || "",
+      numeroPorter: client?.numeroPorter || "",
+      
+      // Onglet Source
+      source: client?.source || "",
+      typeRecommandation: client?.typeRecommandation || "",
+      clientRecommandation: client?.clientRecommandation || "",
+      
+      // Recommandation - Prospect
+      civiliteProspect: client?.civiliteProspect || "",
+      prenomProspect: client?.prenomProspect || "",
+      nomProspect: client?.nomProspect || "",
+      mobileProspect: client?.mobileProspect || "",
+      codePostalProspect: client?.codePostalProspect || "",
+      villeProspect: client?.villeProspect || "",
+      
+      // Commentaire
+      commentaire: client?.commentaire || "",
+      
+      // Date de signature
+      dateSignature: client?.dateSignature || "",
+    },
+  });
+
+  const createMutation = useMutation({
+    mutationFn: async (data: FormValues) => {
+      // Mapper les données du formulaire vers le format API attendu
+      const apiData = {
+        name: `${data.prenom} ${data.nom}`,
+        email: data.email,
+        phone: data.mobile,
+        type: data.produit,
+        status: "actif", // Par défaut, le client est actif
+        identifiant: data.identifiantContrat,
+        company: "",
+        address: data.adresse,
+        city: data.ville,
+        zipCode: data.codePostal,
+        source: data.source,
+        dateOfBirth: data.dateNaissance,
+        signatureDate: data.dateSignature,
+        comment: data.commentaire || "",
+        // Ajouter d'autres champs personnalisés si nécessaire
+        customData: JSON.stringify({
+          portabilite: data.portabilite,
+          numeroPorter: data.numeroPorter,
+          carteSim: data.carteSim,
+          typeRecommandation: data.typeRecommandation,
+          clientRecommandation: data.clientRecommandation,
+          prospect: data.typeRecommandation === 'prospect' ? {
+            civilite: data.civiliteProspect,
+            prenom: data.prenomProspect,
+            nom: data.nomProspect,
+            mobile: data.mobileProspect,
+            codePostal: data.codePostalProspect,
+            ville: data.villeProspect,
+          } : null
+        }),
+      };
+      
+      const response = await apiRequest("POST", "/api/clients", apiData);
+      return response.json();
+    },
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ["/api/clients"] });
+      toast({
+        title: "Félicitations!",
+        description: `Félicitations pour cette nouvelle vente avec ${data.name}!`,
+        duration: 8000, // Afficher pendant 8 secondes
+      });
+      form.reset();
+      onClose();
+    },
+    onError: (error) => {
+      toast({
+        title: "Erreur",
+        description: "Une erreur s'est produite lors de l'ajout du client",
+        variant: "destructive",
+      });
+    },
+  });
+
+  const onSubmit = (data: FormValues) => {
+    createMutation.mutate(data);
+  };
+
+  const isPending = createMutation.isPending;
+
+  return (
+    <Dialog open={isOpen} onOpenChange={onClose}>
+      <DialogContent className="sm:max-w-[900px] max-h-[80vh] sm:max-h-[90vh] overflow-y-auto" hideCloseButton={true}>
+        <DialogTitle className="flex justify-between items-center bg-zinc-100 p-3 rounded-t-lg mb-2">
+          <div className="flex items-center">
+            <User className="mr-2 h-5 w-5" />
+            {client ? (
+              <span>
+                Client: {client.prenom} {client.nom}
+              </span>
+            ) : (
+              "Nouveau client"
+            )}
+          </div>
+          <button
+            onClick={onClose}
+            className="rounded-full p-1 hover:bg-zinc-200"
+          >
+            <X className="h-5 w-5" />
+          </button>
+        </DialogTitle>
+
+        <Form {...form}>
+          <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6 px-6">
+            <Tabs
+              defaultValue="personnel"
+              value={activeTab}
+              onValueChange={setActiveTab}
+              className="w-full"
+            >
+              <TabsList className="grid grid-cols-4 mb-6 h-auto bg-zinc-100 rounded-md p-1">
+                <TabsTrigger
+                  value="personnel"
+                  className="data-[state=active]:bg-white"
+                >
+                  <User className="h-4 w-4 mr-2 sm:mr-0 sm:mb-1" />
+                  <span className="hidden sm:block">Personnel</span>
+                </TabsTrigger>
+                <TabsTrigger
+                  value="adresse"
+                  className="data-[state=active]:bg-white"
+                >
+                  <MapPin className="h-4 w-4 mr-2 sm:mr-0 sm:mb-1" />
+                  <span className="hidden sm:block">Adresse</span>
+                </TabsTrigger>
+                <TabsTrigger
+                  value="contrat"
+                  className="data-[state=active]:bg-white"
+                >
+                  <FileSignature className="h-4 w-4 mr-2 sm:mr-0 sm:mb-1" />
+                  <span className="hidden sm:block">Contrat</span>
+                </TabsTrigger>
+                <TabsTrigger
+                  value="source"
+                  className="data-[state=active]:bg-white"
+                >
+                  <Info className="h-4 w-4 mr-2 sm:mr-0 sm:mb-1" />
+                  <span className="hidden sm:block">Source</span>
+                </TabsTrigger>
+              </TabsList>
+
+              <TabsContent value="personnel" className="space-y-4 mt-0">
+                <FormField
+                  control={form.control}
+                  name="civilite"
+                  render={({ field }) => (
+                    <FormItem>
+                      <div className="flex items-center mb-1">
+                        <User className="h-4 w-4 mr-2 text-gray-500" />
+                        <FormLabel className="text-gray-700">Civilité <span className="text-red-500">*</span></FormLabel>
+                      </div>
+                      <Select
+                        onValueChange={field.onChange}
+                        defaultValue={field.value}
+                        disabled={isPending}
+                      >
+                        <FormControl>
+                          <SelectTrigger className="bg-white border-gray-200">
+                            <SelectValue placeholder="Sélectionner une civilité" />
+                          </SelectTrigger>
+                        </FormControl>
+                        <SelectContent>
+                          {civiliteOptions.map((option) => (
+                            <SelectItem key={option.value} value={option.value}>
+                              {option.label}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+
+                <FormField
+                  control={form.control}
+                  name="prenom"
+                  render={({ field }) => (
+                    <FormItem>
+                      <div className="flex items-center mb-1">
+                        <FormLabel className="text-gray-700">Prénom <span className="text-red-500">*</span></FormLabel>
+                      </div>
+                      <FormControl>
+                        <Input 
+                          placeholder="John" 
+                          className="bg-white border-gray-200"
+                          disabled={isPending}
+                          {...field} 
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+
+                <FormField
+                  control={form.control}
+                  name="nom"
+                  render={({ field }) => (
+                    <FormItem>
+                      <div className="flex items-center mb-1">
+                        <FormLabel className="text-gray-700">Nom <span className="text-red-500">*</span></FormLabel>
+                      </div>
+                      <FormControl>
+                        <Input 
+                          placeholder="Doe" 
+                          className="bg-white border-gray-200"
+                          disabled={isPending}
+                          {...field} 
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+
+                <FormField
+                  control={form.control}
+                  name="dateNaissance"
+                  render={({ field }) => (
+                    <FormItem>
+                      <div className="flex items-center mb-1">
+                        <Calendar className="h-4 w-4 mr-2 text-gray-500" />
+                        <FormLabel className="text-gray-700">Date de naissance <span className="text-red-500">*</span></FormLabel>
+                      </div>
+                      <FormControl>
+                        <Input 
+                          placeholder="jj/mm/aaaa" 
+                          className="bg-white border-gray-200"
+                          disabled={isPending}
+                          {...field} 
+                        />
+                      </FormControl>
+                      <FormDescription className="text-xs text-gray-500">
+                        Format: jj/mm/aaaa (ex: 01/01/1990). Le client doit avoir au moins 18 ans.
+                      </FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+
+                <FormField
+                  control={form.control}
+                  name="email"
+                  render={({ field }) => (
+                    <FormItem>
+                      <div className="flex items-center mb-1">
+                        <Mail className="h-4 w-4 mr-2 text-gray-500" />
+                        <FormLabel className="text-gray-700">Email <span className="text-red-500">*</span></FormLabel>
+                      </div>
+                      <FormControl>
+                        <Input 
+                          type="email" 
+                          placeholder="john.doe@email.com" 
+                          className="bg-white border-gray-200"
+                          disabled={isPending}
+                          {...field} 
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+
+                <FormField
+                  control={form.control}
+                  name="mobile"
+                  render={({ field }) => (
+                    <FormItem>
+                      <div className="flex items-center mb-1">
+                        <Phone className="h-4 w-4 mr-2 text-gray-500" />
+                        <FormLabel className="text-gray-700">Mobile <span className="text-red-500">*</span></FormLabel>
+                      </div>
+                      <FormControl>
+                        <Input 
+                          placeholder="+33612345678" 
+                          className="bg-white border-gray-200"
+                          disabled={isPending}
+                          {...field} 
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+
+                <FormField
+                  control={form.control}
+                  name="fixe"
+                  render={({ field }) => (
+                    <FormItem>
+                      <div className="flex items-center mb-1">
+                        <Phone className="h-4 w-4 mr-2 text-gray-500" />
+                        <FormLabel className="text-gray-700">Fixe (optionnel)</FormLabel>
+                      </div>
+                      <FormControl>
+                        <Input 
+                          placeholder="+33123456789" 
+                          className="bg-white border-gray-200"
+                          disabled={isPending}
+                          {...field} 
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              </TabsContent>
+
+              <TabsContent value="adresse" className="space-y-4 mt-0">
+                <div className="flex items-center mb-2">
+                  <MapPin className="h-5 w-5 mr-2 text-gray-500" />
+                  <h3 className="font-medium">Informations d'adresse</h3>
+                </div>
+                
+                <FormField
+                  control={form.control}
+                  name="adresse"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel className="text-gray-700">Adresse <span className="text-red-500">*</span></FormLabel>
+                      <FormControl>
+                        <Input 
+                          placeholder="12, Avenue de la République" 
+                          className="bg-white border-gray-200"
+                          disabled={isPending}
+                          {...field} 
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                
+                <div className="grid grid-cols-2 gap-4">
+                  <FormField
+                    control={form.control}
+                    name="codePostal"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel className="text-gray-700">Code postal <span className="text-red-500">*</span></FormLabel>
+                        <FormControl>
+                          <Input 
+                            placeholder="75123" 
+                            className="bg-white border-gray-200"
+                            disabled={isPending}
+                            {...field} 
+                            onChange={(e) => {
+                              field.onChange(e);
+                              // Ici, on pourrait implémenter l'auto-complétion de la ville
+                              // en fonction du code postal choisi
+                            }}
+                          />
+                        </FormControl>
+                        <FormDescription className="text-xs text-gray-500">
+                          Le code postal permet l'auto-complétion de la ville
+                        </FormDescription>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                  
+                  <FormField
+                    control={form.control}
+                    name="ville"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel className="text-gray-700">Ville <span className="text-red-500">*</span></FormLabel>
+                        <FormControl>
+                          <Input 
+                            placeholder="Paris" 
+                            className="bg-white border-gray-200"
+                            disabled={isPending}
+                            {...field} 
+                          />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                </div>
+              </TabsContent>
+
+              <TabsContent value="contrat" className="space-y-4 mt-0">
+                {isMobile.current ? (
+                  <ClientFormContratTab 
+                    form={form}
+                    isPending={isPending}
+                    produitOptions={produitOptions}
+                    portabiliteOptions={portabiliteOptions}
+                  />
+                ) : (
+                  <>
+                    <div className="flex items-center mb-2">
+                      <FileSignature className="h-5 w-5 mr-2 text-gray-500" />
+                      <h3 className="font-medium">Informations du contrat</h3>
+                    </div>
+                    
+                    <FormField
+                      control={form.control}
+                      name="produit"
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel className="text-gray-700">Produit <span className="text-red-500">*</span></FormLabel>
+                          <Select
+                            onValueChange={field.onChange}
+                            defaultValue={field.value}
+                            disabled={isPending}
+                          >
+                            <FormControl>
+                              <SelectTrigger className="bg-white border-gray-200">
+                                <SelectValue placeholder="Sélectionner un produit" />
+                              </SelectTrigger>
+                            </FormControl>
+                            <SelectContent>
+                              {produitOptions.map((option) => (
+                                <SelectItem key={option.value} value={option.value}>
+                                  {option.label}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                    
+                    <FormField
+                      control={form.control}
+                      name="identifiantContrat"
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel className="text-gray-700">Identifiant contrat <span className="text-red-500">*</span></FormLabel>
+                          <FormControl>
+                            <Input 
+                              placeholder="FO12345678" 
+                              className="bg-white border-gray-200"
+                              disabled={isPending}
+                              {...field} 
+                            />
+                          </FormControl>
+                          <FormDescription className="text-xs text-gray-500">
+                            Format: FO + 8 chiffres pour Freebox, 8 chiffres pour forfait mobile
+                          </FormDescription>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                    
+                    <FormField
+                      control={form.control}
+                      name="carteSim"
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel className="text-gray-700">Carte SIM (optionnel)</FormLabel>
+                          <FormControl>
+                            <Input 
+                              placeholder="89333..." 
+                              className="bg-white border-gray-200"
+                              disabled={isPending}
+                              {...field} 
+                            />
+                          </FormControl>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                    
+                    <FormField
+                      control={form.control}
+                      name="portabilite"
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel className="text-gray-700">Portabilité (optionnel)</FormLabel>
+                          <Select
+                            onValueChange={field.onChange}
+                            defaultValue={field.value}
+                            disabled={isPending}
+                          >
+                            <FormControl>
+                              <SelectTrigger className="bg-white border-gray-200">
+                                <SelectValue placeholder="Sélectionner..." />
+                              </SelectTrigger>
+                            </FormControl>
+                            <SelectContent>
+                              {portabiliteOptions.map((option) => (
+                                <SelectItem key={option.value} value={option.value}>
+                                  {option.label}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                    
+                    {form.watch('portabilite') === 'portabilite' && (
+                      <FormField
+                        control={form.control}
+                        name="numeroPorter"
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel className="text-gray-700">Numéro à porter <span className="text-red-500">*</span></FormLabel>
+                            <FormControl>
+                              <Input 
+                                placeholder="06 12 34 56 78" 
+                                className="bg-white border-gray-200"
+                                disabled={isPending}
+                                {...field} 
+                              />
+                            </FormControl>
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+                    )}
+                    
+                    <FormField
+                      control={form.control}
+                      name="dateSignature"
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel className="text-gray-700">Date de signature <span className="text-red-500">*</span></FormLabel>
+                          <FormControl>
+                            <Input 
+                              placeholder="jj/mm/aaaa" 
+                              className="bg-white border-gray-200"
+                              disabled={isPending}
+                              {...field} 
+                            />
+                          </FormControl>
+                          <FormDescription className="text-xs text-gray-500">
+                            Format: jj/mm/aaaa (ex: 01/06/2023)
+                          </FormDescription>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                  </>
+                )}
+              </TabsContent>
+
+              <TabsContent value="source" className="space-y-4 mt-0">
+                <div className="flex items-center mb-2">
+                  <Info className="h-5 w-5 mr-2 text-gray-500" />
+                  <h3 className="font-medium">Informations sur la source</h3>
+                </div>
+                
+                <FormField
+                  control={form.control}
+                  name="source"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel className="text-gray-700">Source <span className="text-red-500">*</span></FormLabel>
+                      <Select
+                        onValueChange={(value) => {
+                          field.onChange(value);
+                          // Réinitialiser les champs de recommandation si la source change
+                          if (value !== 'recommandation') {
+                            form.setValue('typeRecommandation', '');
+                            form.setValue('clientRecommandation', '');
+                            form.setValue('civiliteProspect', '');
+                            form.setValue('prenomProspect', '');
+                            form.setValue('nomProspect', '');
+                            form.setValue('mobileProspect', '');
+                            form.setValue('codePostalProspect', '');
+                            form.setValue('villeProspect', '');
+                          }
+                        }}
+                        defaultValue={field.value}
+                        disabled={isPending}
+                      >
+                        <FormControl>
+                          <SelectTrigger className="bg-white border-gray-200">
+                            <SelectValue placeholder="Sélectionner une source" />
+                          </SelectTrigger>
+                        </FormControl>
+                        <SelectContent>
+                          {sourceOptions.map((option) => (
+                            <SelectItem key={option.value} value={option.value}>
+                              {option.label}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                
+                {form.watch('source') === 'recommandation' && (
+                  <>
+                    <FormField
+                      control={form.control}
+                      name="typeRecommandation"
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel className="text-gray-700">Type de recommandation</FormLabel>
+                          <Select
+                            onValueChange={(value) => {
+                              field.onChange(value);
+                              // Réinitialiser les champs selon le type
+                              if (value === 'client') {
+                                form.setValue('civiliteProspect', '');
+                                form.setValue('prenomProspect', '');
+                                form.setValue('nomProspect', '');
+                                form.setValue('mobileProspect', '');
+                                form.setValue('codePostalProspect', '');
+                                form.setValue('villeProspect', '');
+                              } else if (value === 'prospect') {
+                                form.setValue('clientRecommandation', '');
+                              }
+                            }}
+                            defaultValue={field.value}
+                            disabled={isPending}
+                          >
+                            <FormControl>
+                              <SelectTrigger className="bg-white border-gray-200">
+                                <SelectValue placeholder="Sélectionner un type" />
+                              </SelectTrigger>
+                            </FormControl>
+                            <SelectContent>
+                              {typeRecommandationOptions.map((option) => (
+                                <SelectItem key={option.value} value={option.value}>
+                                  {option.label}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                    
+                    {form.watch('typeRecommandation') === 'client' && (
+                      <FormField
+                        control={form.control}
+                        name="clientRecommandation"
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel className="text-gray-700">Client qui recommande</FormLabel>
+                            <FormControl>
+                              <Input 
+                                placeholder="Nom du client" 
+                                className="bg-white border-gray-200"
+                                disabled={isPending}
+                                {...field} 
+                              />
+                            </FormControl>
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+                    )}
+                    
+                    {form.watch('typeRecommandation') === 'prospect' && (
+                      <>
+                        <div className="flex items-center mt-6 mb-2">
+                          <User className="h-5 w-5 mr-2 text-gray-500" />
+                          <h3 className="font-medium">Informations sur le prospect</h3>
+                        </div>
+                        
+                        <FormField
+                          control={form.control}
+                          name="civiliteProspect"
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel className="text-gray-700">Civilité</FormLabel>
+                              <Select
+                                onValueChange={field.onChange}
+                                defaultValue={field.value}
+                                disabled={isPending}
+                              >
+                                <FormControl>
+                                  <SelectTrigger className="bg-white border-gray-200">
+                                    <SelectValue placeholder="Sélectionner une civilité" />
+                                  </SelectTrigger>
+                                </FormControl>
+                                <SelectContent>
+                                  {civiliteOptions.map((option) => (
+                                    <SelectItem key={option.value} value={option.value}>
+                                      {option.label}
+                                    </SelectItem>
+                                  ))}
+                                </SelectContent>
+                              </Select>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                        
+                        <div className="grid grid-cols-2 gap-4">
+                          <FormField
+                            control={form.control}
+                            name="prenomProspect"
+                            render={({ field }) => (
+                              <FormItem>
+                                <FormLabel className="text-gray-700">Prénom</FormLabel>
+                                <FormControl>
+                                  <Input 
+                                    placeholder="John" 
+                                    className="bg-white border-gray-200"
+                                    disabled={isPending}
+                                    {...field} 
+                                  />
+                                </FormControl>
+                                <FormMessage />
+                              </FormItem>
+                            )}
+                          />
+                          
+                          <FormField
+                            control={form.control}
+                            name="nomProspect"
+                            render={({ field }) => (
+                              <FormItem>
+                                <FormLabel className="text-gray-700">Nom</FormLabel>
+                                <FormControl>
+                                  <Input 
+                                    placeholder="Doe" 
+                                    className="bg-white border-gray-200"
+                                    disabled={isPending}
+                                    {...field} 
+                                  />
+                                </FormControl>
+                                <FormMessage />
+                              </FormItem>
+                            )}
+                          />
+                        </div>
+                        
+                        <FormField
+                          control={form.control}
+                          name="mobileProspect"
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel className="text-gray-700">Mobile</FormLabel>
+                              <FormControl>
+                                <Input 
+                                  placeholder="+33612345678" 
+                                  className="bg-white border-gray-200"
+                                  disabled={isPending}
+                                  {...field} 
+                                />
+                              </FormControl>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                        
+                        <div className="grid grid-cols-2 gap-4">
+                          <FormField
+                            control={form.control}
+                            name="codePostalProspect"
+                            render={({ field }) => (
+                              <FormItem>
+                                <FormLabel className="text-gray-700">Code postal</FormLabel>
+                                <FormControl>
+                                  <Input 
+                                    placeholder="75123" 
+                                    className="bg-white border-gray-200"
+                                    disabled={isPending}
+                                    {...field} 
+                                  />
+                                </FormControl>
+                                <FormMessage />
+                              </FormItem>
+                            )}
+                          />
+                          
+                          <FormField
+                            control={form.control}
+                            name="villeProspect"
+                            render={({ field }) => (
+                              <FormItem>
+                                <FormLabel className="text-gray-700">Ville</FormLabel>
+                                <FormControl>
+                                  <Input 
+                                    placeholder="Paris" 
+                                    className="bg-white border-gray-200"
+                                    disabled={isPending}
+                                    {...field} 
+                                  />
+                                </FormControl>
+                                <FormMessage />
+                              </FormItem>
+                            )}
+                          />
+                        </div>
+                      </>
+                    )}
+                  </>
+                )}
+                
+                <FormField
+                  control={form.control}
+                  name="commentaire"
+                  render={({ field }) => (
+                    <FormItem className="mt-4">
+                      <FormLabel className="text-gray-700">Commentaire (optionnel)</FormLabel>
+                      <FormControl>
+                        <Textarea 
+                          placeholder="Informations complémentaires sur le client..." 
+                          className="bg-white border-gray-200 min-h-[100px]"
+                          disabled={isPending}
+                          {...field} 
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              </TabsContent>
+            </Tabs>
+            
+            <div className="flex justify-end space-x-2 pt-4 border-t border-gray-200">
+              <Button 
+                type="button" 
+                variant="outline" 
+                onClick={onClose}
+                disabled={isPending}
+              >
+                Annuler
+              </Button>
+              
+              <Button 
+                type="submit" 
+                disabled={isPending}
+                className="bg-black text-white hover:bg-gray-800"
+              >
+                {isPending ? (
+                  <>
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    Enregistrement...
+                  </>
+                ) : (
+                  <>
+                    <Check className="mr-2 h-4 w-4" />
+                    Enregistrer
+                  </>
+                )}
+              </Button>
+            </div>
+          </form>
+        </Form>
+      </DialogContent>
+    </Dialog>
+  );
+}
