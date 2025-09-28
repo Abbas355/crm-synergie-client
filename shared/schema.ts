@@ -445,12 +445,12 @@ export const prospectionRelations = relations(prospection, ({ one }) => ({
 
 // Schémas pour les clients
 export const clientsInsertSchema = createInsertSchema(clients, {
-  prenom: (schema) => schema.string().min(2, "Le prénom doit contenir au moins 2 caractères"),
-  nom: (schema) => schema.string().min(2, "Le nom doit contenir au moins 2 caractères"),
-  email: (schema) => schema.string().email("Email invalide").optional(),
-  telephone: (schema) => schema.string().optional(),
-  identifiantContrat: (schema) => schema.string().optional(),
-  produit: (schema) => schema.string().min(1, "Le produit est requis"),
+  prenom: z.string().min(2, "Le prénom doit contenir au moins 2 caractères"),
+  nom: z.string().min(2, "Le nom doit contenir au moins 2 caractères"),
+  email: z.string().email("Email invalide").optional(),
+  telephone: z.string().optional(),
+  identifiantContrat: z.string().optional(),
+  produit: z.string().min(1, "Le produit est requis"),
 });
 
 export const clientsSelectSchema = createSelectSchema(clients);
@@ -510,8 +510,8 @@ export type ClientFormValues = z.infer<typeof clientFormSchema>;
 
 // Schémas pour les cartes SIM
 export const sim_cardsInsertSchema = createInsertSchema(sim_cards, {
-  numero: (schema) => schema.string().min(15, "Le numéro doit contenir au moins 15 caractères"),
-  statut: (schema) => schema.string().default("disponible"),
+  numero: z.string().min(15, "Le numéro doit contenir au moins 15 caractères"),
+  statut: z.string().default("disponible"),
 });
 
 export const sim_cardsSelectSchema = createSelectSchema(sim_cards);
@@ -520,9 +520,9 @@ export type SimCardSelect = z.infer<typeof sim_cardsSelectSchema>;
 
 // Schémas pour les tâches
 export const tasksInsertSchema = createInsertSchema(tasks, {
-  title: (schema) => schema.string().min(5, "Le titre doit contenir au moins 5 caractères"),
-  status: (schema) => schema.string().default("pending"),
-  priority: (schema) => schema.string().default("medium"),
+  title: z.string().min(5, "Le titre doit contenir au moins 5 caractères"),
+  status: z.string().default("pending"),
+  priority: z.string().default("medium"),
 });
 
 export const tasksSelectSchema = createSelectSchema(tasks);
@@ -537,9 +537,9 @@ export type TaskHistorySelect = z.infer<typeof taskHistorySelectSchema>;
 
 // Schémas pour les utilisateurs
 export const usersInsertSchema = createInsertSchema(users, {
-  username: (schema) => schema.string().min(3, "Le nom d'utilisateur doit contenir au moins 3 caractères"),
-  password: (schema) => schema.string().min(6, "Le mot de passe doit contenir au moins 6 caractères"),
-  email: (schema) => schema.string().email("Email invalide").optional(),
+  username: z.string().min(3, "Le nom d'utilisateur doit contenir au moins 3 caractères"),
+  password: z.string().min(6, "Le mot de passe doit contenir au moins 6 caractères"),
+  email: z.string().email("Email invalide").optional(),
 });
 
 export const usersSelectSchema = createSelectSchema(users);
@@ -548,29 +548,29 @@ export type UserSelect = z.infer<typeof usersSelectSchema>;
 
 // Schémas pour les prospects
 export const prospectsInsertSchema = createInsertSchema(prospects, {
-  prenom: (schema) => schema.optional(),
-  nom: (schema) => schema.optional(),
-  email: (schema) => schema.nullable().optional(),
-  telephone: (schema) => schema.string().min(10, "Le téléphone doit contenir au moins 10 caractères"),
-  type: (schema) => schema.refine(val => ["client", "vendeur"].includes(val), "Type invalide"),
-  stade: (schema) => schema.default("nouveau"),
-  userId: (schema) => schema.number().min(1, "L'utilisateur est requis"),
-  commentaire: (schema) => schema.optional(),
-  dernierContact: (schema) => schema.optional(),
-  prochainContact: (schema) => schema.optional(),
+  prenom: z.string().optional(),
+  nom: z.string().optional(),
+  email: z.string().nullable().optional(),
+  telephone: z.string().min(10, "Le téléphone doit contenir au moins 10 caractères"),
+  type: z.string().refine(val => ["client", "vendeur"].includes(val), "Type invalide"),
+  stade: z.string().default("nouveau"),
+  userId: z.number().min(1, "L'utilisateur est requis"),
+  commentaire: z.string().optional(),
+  dernierContact: z.date().optional(),
+  prochainContact: z.date().optional(),
   // Nouveaux champs pour prospects vendeurs
-  experienceCommerciale: (schema) => schema.optional(),
-  secteurActuel: (schema) => schema.optional(),
-  motivationPrincipale: (schema) => schema.optional(),
-  disponibilite: (schema) => schema.optional(),
-  experienceVenteDirecte: (schema) => schema.optional(),
-  objectifRevenus: (schema) => schema.optional(),
-  zoneGeographique: (schema) => schema.optional(),
-  moyensTransport: (schema) => schema.optional(),
-  etapeProcessus: (schema) => schema.optional(),
-  documentsEnvoyes: (schema) => schema.optional(),
-  parrainReferent: (schema) => schema.optional(),
-  dateFormationPrevue: (schema) => schema.optional(),
+  experienceCommerciale: z.string().optional(),
+  secteurActuel: z.string().optional(),
+  motivationPrincipale: z.string().optional(),
+  disponibilite: z.string().optional(),
+  experienceVenteDirecte: z.string().optional(),
+  objectifRevenus: z.string().optional(),
+  zoneGeographique: z.string().optional(),
+  moyensTransport: z.string().optional(),
+  etapeProcessus: z.string().optional(),
+  documentsEnvoyes: z.string().optional(),
+  parrainReferent: z.string().optional(),
+  dateFormationPrevue: z.date().optional(),
   // scoreInteret supprimé, remplacé par economyData
 }).refine((data) => {
   // Au moins nom OU prénom doit être renseigné
@@ -586,12 +586,12 @@ export type ProspectSelect = z.infer<typeof prospectsSelectSchema>;
 
 // Schémas pour la prospection
 export const prospectionInsertSchema = createInsertSchema(prospection, {
-  ville: (schema) => schema.string().min(2, "La ville doit contenir au moins 2 caractères"),
-  typeActivite: (schema) => schema.string().refine(val => ["porte_a_porte", "telephonie", "evenement", "recommandation", "digital"].includes(val), "Type d'activité invalide"),
-  nombreContacts: (schema) => schema.number().min(0, "Le nombre de contacts ne peut pas être négatif"),
-  contactsQualifies: (schema) => schema.number().min(0, "Le nombre de contacts qualifiés ne peut pas être négatif"),
-  satisfaction: (schema) => schema.number().min(1, "La satisfaction doit être entre 1 et 5").max(5, "La satisfaction doit être entre 1 et 5").optional(),
-  tempsPasse: (schema) => schema.number().min(0, "Le temps passé ne peut pas être négatif"),
+  ville: z.string().min(2, "La ville doit contenir au moins 2 caractères"),
+  typeActivite: z.string().refine(val => ["porte_a_porte", "telephonie", "evenement", "recommandation", "digital"].includes(val), "Type d'activité invalide"),
+  nombreContacts: z.number().min(0, "Le nombre de contacts ne peut pas être négatif"),
+  contactsQualifies: z.number().min(0, "Le nombre de contacts qualifiés ne peut pas être négatif"),
+  satisfaction: z.number().min(1, "La satisfaction doit être entre 1 et 5").max(5, "La satisfaction doit être entre 1 et 5").optional(),
+  tempsPasse: z.number().min(0, "Le temps passé ne peut pas être négatif"),
 });
 
 export const prospectionSelectSchema = createSelectSchema(prospection);
@@ -600,10 +600,10 @@ export type ProspectionSelect = z.infer<typeof prospectionSelectSchema>;
 
 // Schémas pour la prospection terrain
 export const prospectionTerrainSessionsInsertSchema = createInsertSchema(prospection_terrain_sessions, {
-  commercial: (schema) => schema.string().min(2, "Le nom du commercial doit contenir au moins 2 caractères"),
-  zone: (schema) => schema.string().min(1, "La zone doit être renseignée").default("Zone 1"),
-  ville: (schema) => schema.string().min(2, "La ville doit contenir au moins 2 caractères"),
-  statut: (schema) => schema.string().refine(val => ["planifiee", "en_cours", "terminee"].includes(val), "Statut invalide"),
+  commercial: z.string().min(2, "Le nom du commercial doit contenir au moins 2 caractères"),
+  zone: z.string().min(1, "La zone doit être renseignée").default("Zone 1"),
+  ville: z.string().min(2, "La ville doit contenir au moins 2 caractères"),
+  statut: z.string().refine(val => ["planifiee", "en_cours", "terminee"].includes(val), "Statut invalide"),
 });
 
 export const prospectionTerrainSessionsSelectSchema = createSelectSchema(prospection_terrain_sessions);
@@ -611,16 +611,16 @@ export type ProspectionTerrainSessionInsert = z.infer<typeof prospectionTerrainS
 export type ProspectionTerrainSessionSelect = z.infer<typeof prospectionTerrainSessionsSelectSchema>;
 
 export const prospectionTerrainContactsInsertSchema = createInsertSchema(prospection_terrain_contacts, {
-  etage: (schema) => z.coerce.number().int().min(-10, "L'étage doit être entre -10 et 50 (sous-sols autorisés)").max(50, "L'étage ne peut pas dépasser 50"),
-  numeroPorte: (schema) => schema.string().min(1, "Le numéro de porte est requis"),
-  nom: (schema) => schema.optional().refine(val => !val || val.length >= 2, "Le nom doit contenir au moins 2 caractères si renseigné"),
-  mobile: (schema) => schema.optional(),
-  email: (schema) => schema.optional(),
-  resultatMatin: (schema) => schema.refine(val => !val || val === "" || ["vide", "absent", "personne_agee", "pas_interesse", "refus_ouvrir", "va_demenager", "a_revoir", "argumentation", "veux_reflechir", "voir_mr", "voir_mme", "voir_parents", "rdv", "signature"].includes(val), "Résultat matin invalide").optional(),
-  resultatMidi: (schema) => schema.refine(val => !val || val === "" || ["vide", "absent", "personne_agee", "pas_interesse", "refus_ouvrir", "va_demenager", "a_revoir", "argumentation", "veux_reflechir", "voir_mr", "voir_mme", "voir_parents", "rdv", "signature"].includes(val), "Résultat midi invalide").optional(),
-  resultatApresMidi: (schema) => schema.refine(val => !val || val === "" || ["vide", "absent", "personne_agee", "pas_interesse", "refus_ouvrir", "va_demenager", "a_revoir", "argumentation", "veux_reflechir", "voir_mr", "voir_mme", "voir_parents", "rdv", "signature"].includes(val), "Résultat après-midi invalide").optional(),
-  resultatSoir: (schema) => schema.refine(val => !val || val === "" || ["vide", "absent", "personne_agee", "pas_interesse", "refus_ouvrir", "va_demenager", "a_revoir", "argumentation", "veux_reflechir", "voir_mr", "voir_mme", "voir_parents", "rdv", "signature"].includes(val), "Résultat soir invalide").optional(),
-  statusFinal: (schema) => schema.refine(val => !val || val === "" || ["vide", "RDV", "SIGNATURE", "ABS", "REFUS", "PA", "PI", "RO", "CFORG", "CFFREE", "CFSFR", "CFBYG"].includes(val), "Statut final invalide").optional(),
+  etage: z.coerce.number().int().min(-10, "L'étage doit être entre -10 et 50 (sous-sols autorisés)").max(50, "L'étage ne peut pas dépasser 50"),
+  numeroPorte: z.string().min(1, "Le numéro de porte est requis"),
+  nom: z.string().optional().refine(val => !val || val.length >= 2, "Le nom doit contenir au moins 2 caractères si renseigné"),
+  mobile: z.string().optional(),
+  email: z.string().optional(),
+  resultatMatin: z.string().refine(val => !val || val === "" || ["vide", "absent", "personne_agee", "pas_interesse", "refus_ouvrir", "va_demenager", "a_revoir", "argumentation", "veux_reflechir", "voir_mr", "voir_mme", "voir_parents", "rdv", "signature"].includes(val), "Résultat matin invalide").optional(),
+  resultatMidi: z.string().refine(val => !val || val === "" || ["vide", "absent", "personne_agee", "pas_interesse", "refus_ouvrir", "va_demenager", "a_revoir", "argumentation", "veux_reflechir", "voir_mr", "voir_mme", "voir_parents", "rdv", "signature"].includes(val), "Résultat midi invalide").optional(),
+  resultatApresMidi: z.string().refine(val => !val || val === "" || ["vide", "absent", "personne_agee", "pas_interesse", "refus_ouvrir", "va_demenager", "a_revoir", "argumentation", "veux_reflechir", "voir_mr", "voir_mme", "voir_parents", "rdv", "signature"].includes(val), "Résultat après-midi invalide").optional(),
+  resultatSoir: z.string().refine(val => !val || val === "" || ["vide", "absent", "personne_agee", "pas_interesse", "refus_ouvrir", "va_demenager", "a_revoir", "argumentation", "veux_reflechir", "voir_mr", "voir_mme", "voir_parents", "rdv", "signature"].includes(val), "Résultat soir invalide").optional(),
+  statusFinal: z.string().refine(val => !val || val === "" || ["vide", "RDV", "SIGNATURE", "ABS", "REFUS", "PA", "PI", "RO", "CFORG", "CFFREE", "CFSFR", "CFBYG"].includes(val), "Statut final invalide").optional(),
 });
 
 export const prospectionTerrainContactsSelectSchema = createSelectSchema(prospection_terrain_contacts);
@@ -905,10 +905,10 @@ export const legalComplianceChecksRelations = relations(legalComplianceChecks, (
 
 // Schemas de validation pour les contrats
 export const contractInsertSchema = createInsertSchema(contracts, {
-  vendorName: (schema) => schema.string().min(2, "Le nom du vendeur doit faire au moins 2 caractères"),
-  distributorName: (schema) => schema.string().min(2, "Le nom du distributeur doit faire au moins 2 caractères"),
-  type: (schema) => schema.string().min(1, "Le type de contrat est obligatoire"),
-  status: (schema) => schema.string().min(1, "Le statut est obligatoire"),
+  vendorName: z.string().min(2, "Le nom du vendeur doit faire au moins 2 caractères"),
+  distributorName: z.string().min(2, "Le nom du distributeur doit faire au moins 2 caractères"),
+  type: z.string().min(1, "Le type de contrat est obligatoire"),
+  status: z.string().min(1, "Le statut est obligatoire"),
 });
 
 export const contractSelectSchema = createSelectSchema(contracts);
@@ -917,17 +917,17 @@ export const contractTemplateSelectSchema = createSelectSchema(contractTemplates
 
 // Schémas pour les termes contractuels
 export const contractTermsInsertSchema = createInsertSchema(contractTerms, {
-  sectionName: (schema) => schema.string().min(1, "Le nom de la section est obligatoire"),
-  content: (schema) => schema.string().min(1, "Le contenu est obligatoire"),
-  position: (schema) => schema.number().min(0, "La position doit être positive"),
+  sectionName: z.string().min(1, "Le nom de la section est obligatoire"),
+  content: z.string().min(1, "Le contenu est obligatoire"),
+  position: z.number().min(0, "La position doit être positive"),
 });
 
 export const contractTermsSelectSchema = createSelectSchema(contractTerms);
 
 // Schémas pour les balises
 export const contractTagsInsertSchema = createInsertSchema(contractTags, {
-  name: (schema) => schema.string().min(1, "Le nom de la balise est obligatoire"),
-  dataType: (schema) => schema.string().min(1, "Le type de données est obligatoire"),
+  name: z.string().min(1, "Le nom de la balise est obligatoire"),
+  dataType: z.string().min(1, "Le type de données est obligatoire"),
 });
 
 export const contractTagsSelectSchema = createSelectSchema(contractTags);
